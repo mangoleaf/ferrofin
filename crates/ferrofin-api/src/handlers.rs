@@ -1181,13 +1181,22 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    service, so RefreshGuide's innerProgress passes each report on times 1; a \
                    second ILiveTvService is a plugin's. The task then reports RefreshGuide's \
                    closing 100, and adds none for a refresh its stop ended (one stopped in \
-                   the image pre-cache already reads 100). A refresh a newer one superseded \
-                   while it fetched writes nothing, and goes from 10 to that 100. \
+                   the image pre-cache already reads 100). A Live TV configuration write \
+                   queues a run of the task (handlers/live_tv.rs queue_guide_refresh, \
+                   CancelIfRunningAndQueue<RefreshGuideScheduledTask>), so its refresh \
+                   reports the same values: a run the write stops records Cancelled, and \
+                   the queued run starts again at 10. \
                    Compared with RefreshGuide, RefreshChannelsInternal and CleanDatabase at \
                    the pinned v12.4 tag. Live on a scratch server (gl-2021), GET \
                    /ScheduledTasks/{taskId} polled through a run over 300 channels and a \
                    tuner answering in 4 s: 10 from the first poll, then 15, each of the 300 \
-                   per-channel values in order up to 100, and no value once Idle",
+                   per-channel values in order up to 100, and no value once Idle. Live \
+                   again for the queued runs (gl-54), a tuner answering in 2 s: a tuner save \
+                   then a guide save left the first run Cancelled and the second Running \
+                   from 10 through the per-channel values to Completed; five channel \
+                   mappings 0.4 s apart, then eight at the same moment, each ran one \
+                   refresh at a time, the stopped ones Cancelled and their tuner requests \
+                   dropped, and the guide came to rest on the mapping stored last",
         date: "2026-11-27",
         divergences: &[
             "The clean-ups report nothing, so the value never starts again: upstream runs \
@@ -1207,10 +1216,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              every listings provider and writes its airings (insert_programs) before the \
              15, and pre-caches after the 100; the fetches and the pre-cache run outside \
              the guide's write lock. Open: owner decision pending, tracked in gl-2027.",
-            "A guide refresh a Live TV configuration write queues is not a run of the task \
-             (handlers/live_tv.rs queue_guide_refresh spawns refresh_guide), so the task \
-             shows no state, progress or result for it; upstream queues the task itself \
-             (CancelIfRunningAndQueue<RefreshGuideScheduledTask>). Fix path: gl-54.",
         ],
     },
     VerifiedSubsystem {
@@ -4941,7 +4946,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/LiveTv/ListingProviders",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "AddListingProvider",
-        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+        ferrofin: "handlers/live_tv.rs add_listing_provider, which ends with \
+               queue_guide_refresh once the provider is stored (the DELETE \
+               /LiveTv/TunerHosts row's) → ferrofin-livetv manager.rs \
                save_listing_provider (ListingsBackend::of, validate_xmltv, \
                store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
@@ -4978,6 +4985,28 @@ pub const VERIFIED: &[Verified] = &[
          Fix path: gl-666.",
         ],
         refs: &["outbound-http"],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "DeleteListingProvider",
+        ferrofin: "handlers/live_tv.rs delete_listing_provider (RequireAdmin, \
+               Policies.RequiresElevation; id as string?, other query values ignored) → \
+               ferrofin-livetv manager.rs delete_listing_provider (the row whose Id equals id \
+               ignoring case, as OrdinalIgnoreCase over ids both servers mint as 32 hex \
+               digits; xmltv_cache.rs XmlTvCache::invalidate, for an id of exactly those 32 \
+               digits, as InvalidateListingsProviderCache's Guid.TryParseExact(id, \"N\"), \
+               whose in-memory EPG channel cache has no counterpart to clear; \
+               spawn_recording_folders, as the livetv configuration's \
+               NamedConfigurationUpdated) (ListingsManager.DeleteListingsProvider). A missing, \
+               empty or unknown id deletes nothing, and the answer is 204 either way. The \
+               provider's airings stay listed until the refresh's clean-up drops them \
+               (GuideManager.CleanDatabase). Then queue_guide_refresh, the DELETE \
+               /LiveTv/TunerHosts row's",
+        date: "2026-11-27",
+        divergences: &[],
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -5245,10 +5274,28 @@ pub const VERIFIED: &[Verified] = &[
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "DeleteTunerHost",
-        ferrofin: "handlers/live_tv.rs delete_tuner_host → ferrofin-livetv manager.rs \
-               delete_tuner_host, then queue_guide_refresh → refresh_guide's clean_database \
-               prune (TunerHostManager.DeleteTunerHost, GuideManager.CleanDatabase)",
-        date: "2026-10-28",
+        ferrofin: "handlers/live_tv.rs delete_tuner_host (RequireAdmin, Policies.RequiresElevation; \
+               id as string?, other query values ignored) → ferrofin-livetv manager.rs \
+               delete_tuner_host (the row whose Id equals id ignoring case, as \
+               OrdinalIgnoreCase over ids both servers mint as 32 hex digits; \
+               spawn_recording_folders, as the livetv configuration's \
+               NamedConfigurationUpdated) (TunerHostManager.DeleteTunerHost, whose \
+               {cache}/{id}_channels file has no counterpart to delete: no tuner's channels \
+               are cached on disk). A missing, empty or unknown id deletes nothing, and the \
+               answer is 204 either way. The host's channels and airings stay listed until \
+               the refresh's clean-up drops them (GuideManager.CleanDatabase). Then \
+               queue_guide_refresh, which the five Live TV configuration writes share → \
+               TaskManager::cancel_if_running_and_queue on the RefreshGuide task's wire id \
+               (TaskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>) → \
+               ferrofin-core scheduled_tasks.rs cancel (CancelIfRunning: a Running run's \
+               token is cancelled, and the refresh ends where it checks it) and \
+               queue_scheduled (QueueScheduledTask with new TaskOptions(): started when \
+               Idle, else one run queued until the current one has ended, \
+               ExecuteQueuedTasks). The run that ends last started after the last write \
+               and reads what it stored, and the request waits for none of it. A registry \
+               that refuses the run (the server is shutting down) is logged and the write \
+               still answers; upstream's call cannot fail",
+        date: "2026-11-27",
         divergences: &[],
         refs: &[],
     },
@@ -5322,8 +5369,9 @@ pub const VERIFIED: &[Verified] = &[
                (listing_provider_by_id, the channelMappingExists toggle, \
                store_listing_provider as SaveConfiguration, without the XMLTV cache \
                invalidation SaveListingProvider adds, channels_for_listings_provider, \
-               provider_channels, mapping.rs tuner_channel_mapping), then queue_guide_refresh \
-               (ListingsManager.SetChannelMapping, \
+               provider_channels, mapping.rs tuner_channel_mapping), then, before the 404 for \
+               a tuner channel no lineup has, queue_guide_refresh, the DELETE \
+               /LiveTv/TunerHosts row's (ListingsManager.SetChannelMapping, \
                CancelIfRunningAndQueue<RefreshGuideScheduledTask>). The tuner list and the \
                match ladder are the ChannelMappingOptions row's, so a mapping keyed \
                hdhr_{GuideNumber} applies since gl-1751, and so is the guide read: a local \
