@@ -2851,7 +2851,41 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    dropped (credits an earlier build stored for such a kind stay: gl-1955); \
                    and the NFO and XML savers write the credits LibraryManager.GetPeople(item) \
                    reads, none for such a kind (metadata_merge.rs stored_people from nfo_save.rs \
-                   and container_xml.rs). Compared with RefreshMetadata, \
+                   and container_xml.rs). A file item's own refresh (ScanTarget::Items; \
+                   the playback probe's forced FullRefresh included, as \
+                   GetPlaybackMediaSources' RefreshMetadata) runs BaseItem.RefreshMetadata's \
+                   RefreshedOwnedItems with it: library_scan.rs PlanScope::extras keeps the \
+                   extras the full plan gives a video at the refreshed path and its local \
+                   versions (GetOwnedVersionIds; a version refreshed on its own finds none, \
+                   Video.RefreshedOwnedItems, nor does a stacked part, which the planner gives \
+                   no extras), beside it and in the extras folders of the \
+                   folder it owns (FindExtras; a multi-disc set's, from its first disc, \
+                   PlanCtx::refinds_extras_in), and those of an episode owning videos in a \
+                   folder of its own (plan_episode_folder_extras). refreshes_extras is \
+                   RefreshExtras' early return: they refresh with its options \
+                   (RefreshMetadataForOwnedItem; PathScope::refreshes_extra, by owner) only \
+                   when the found set differs from the stored one (by path, which a stored id \
+                   an older scan derived differently keeps), FindExtras renames one (its \
+                   locked fields read), or the refresh is a FullRefresh or ReplaceAllMetadata, \
+                   and the item itself then saves with ForceSave (RefreshMetadata's \
+                   requiresSave: PathScope::forces_save), and otherwise take only its dates \
+                   (InheritDatesFromOwner); the stored ones it did not find (removedExtraIds, \
+                   ExtraType set: gone_extras) are removed through prune_deleted on their \
+                   paths alone, and a set found smaller gives the rest the title metadata \
+                   (copy_to_owned_videos' found). The generated Primary of a row a scan \
+                   refreshes (a music or photo album, a folder, a playlist file) is drawn in \
+                   its closing passes as the last of its providers (ferrofin-core \
+                   dynamic_images.rs refresh_rows_between), which writes the \
+                   DateLastRefreshed stamp the walk (library_scan.rs ItemPass::draw_pending) \
+                   or an album's music pass (library_scan/music.rs MusicRefresh::draw) left \
+                   it, withheld when the draw failed (RunCustomProvider's Failures), and \
+                   on an ImageUpdate makes the row's repository save (SaveInternal's \
+                   updateType > None: touch_item_updated moves DateLastSaved and announces \
+                   ItemUpdated) and runs its metadata savers (SaveItemAsync's \
+                   SaveMetadataAsync, library_scan.rs draw_refreshed_rows). Compared with \
+                   RefreshMetadata, RunCustomProvider, BaseDynamicImageProvider.FetchAsync, \
+                   BaseItem.RefreshMetadata, RefreshedOwnedItems, RefreshExtras, \
+                   Video.RefreshedOwnedItems, MediaSourceManager.GetPlaybackMediaSources, \
                    EnableUpdateMetadataFromChildren, \
                    SeasonMetadataService.UpdateMetadataFromChildren and SaveIsVirtualItem, \
                    Series.RefreshAllMetadataInternal and Folder.RefreshAllMetadataForContainer, \
@@ -2867,6 +2901,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the answers merge field by field (gl-1813) are not part of this row.",
         date: "2026-11-26",
         divergences: &[
+            "A full refresh that changes nothing saves a row with a generated Primary for its \
+             DateLastRefreshed stamp before the closing pass draws it, so a draw that then \
+             fails leaves the row saved (DateLastSaved and Etag moved) without the stamp; \
+             upstream's failed provider drops the stamp-only save too. Fix path: gl-1993.",
             "A child of an identified item but a season or an episode (an album below an \
              identified artist, a box set the scan refreshes through the provider \
              manager) is looked up by its own ids, name and year; upstream's \
@@ -2939,6 +2977,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the playlist file, which empties the playlist. Jellyfin bug not ported, and \
              Ferrofin writes no such file into a media folder for a Jellyfin to read back \
              (owner decision 2026-11-24, gl-1915).",
+            "A stored extra a file item's refresh does not find again stays while its file \
+             is still on disk and no listing excludes it (prune_deleted's backstop against a \
+             listing that came back short, which a folder validation applies too); \
+             upstream's RefreshExtras deletes every stored extra FindExtras did not hand \
+             back. Fix path: gl-1982 (owner decision pending).",
         ],
     },
     VerifiedSubsystem {

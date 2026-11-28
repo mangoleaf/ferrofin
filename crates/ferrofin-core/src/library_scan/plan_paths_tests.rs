@@ -131,6 +131,9 @@ const MOVIES: &[&str] = &[
     "Sound of Music/trailers/Sound of Music Trailer.mkv",
     // Named after the set's title and year: its trailer.
     "Sound of Music/Sound of Music (1965)-trailer.mkv",
+    // So is one in the set folder's extras folder, which the set's own
+    // refresh (at its first disc) reads.
+    "Sound of Music/trailers/Sound of Music (1965).mkv",
     "Collections/Alien/Aliens (1986).mkv",
     "Collections/Alien/Alien 3 (1992).mkv",
     "Soundtrack/score.mp3",
@@ -563,6 +566,162 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     assert_eq!(
         canon(scanner.plan_paths(&folders, PlanScope::paths(&albums, Some(&artist)))),
         canon(filtered(&full, &albums, Some(&artist))),
+    );
+}
+
+/// `GetOwnedVersionIds` of `item` in the full plan `full` when it is a
+/// primary the walk searched extras for (an owner it registered, or one it
+/// gave an extra): `item` and its local versions. Empty otherwise.
+fn extras_group(full: &super::PlanOutput, item: &Planned) -> std::collections::HashSet<Uuid> {
+    let id = item.entity.id.as_str();
+    let owns_extras = full.owner_paths.contains_key(&item.id)
+        || full
+            .items
+            .iter()
+            .any(|p| p.entity.extra_type.is_some() && p.entity.owner_id.as_deref() == Some(id));
+    if !owns_extras || item.entity.owner_id.is_some() {
+        return std::collections::HashSet::new();
+    }
+    full.items
+        .iter()
+        .filter(|p| {
+            p.id == item.id
+                || (p.entity.extra_type.is_none()
+                    && p.entity.primary_version_id.as_deref() == Some(id))
+        })
+        .map(|p| p.id)
+        .collect()
+}
+
+/// An item's own refresh ([`PlanScope::extras`], `RefreshExtras`): planning
+/// one video's path plans what the filtered full plan holds for it plus the
+/// extras the full plan gives it and its local versions — beside it, in its
+/// folder's extras folders, a disc rip's or a multi-disc set's — and records
+/// those owners as found whole. A version or a part at the path, a video the
+/// full plan gives no extras folder (at the library's top, in a mixed
+/// folder, in a photo album), and every other path find none.
+#[tokio::test]
+async fn an_items_plan_finds_again_the_extras_the_full_plan_gives_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folders = fixture(tmp.path());
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let full = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    assert!(
+        full.refound.is_empty(),
+        "a library scan finds no extras again"
+    );
+    let mut refinding: Vec<String> = Vec::new();
+    for item in full.items.iter().filter(|p| {
+        p.entity.extra_type.is_none() && p.entity.media_type.as_deref() == Some("Video")
+    }) {
+        let path = item.entity.path.clone().expect("a video has a path");
+        let roots = std::slice::from_ref(&path);
+        let group = extras_group(&full, item);
+        let kept: std::collections::HashSet<Uuid> = filtered(&full.items, roots, None)
+            .iter()
+            .map(|p| p.id)
+            .chain(
+                full.items
+                    .iter()
+                    .filter(|p| p.entity.extra_type.is_some())
+                    .filter(|p| {
+                        p.entity
+                            .owner_id
+                            .as_deref()
+                            .and_then(|owner| Uuid::parse_str(owner).ok())
+                            .is_some_and(|owner| group.contains(&owner))
+                    })
+                    .map(|p| p.id),
+            )
+            .collect();
+        let expected: Vec<Planned> = full
+            .items
+            .iter()
+            .filter(|p| kept.contains(&p.id))
+            .map(|p| Planned {
+                id: p.id,
+                entity: p.entity.clone(),
+                ancestors: p.ancestors.clone(),
+                generated_names: p.generated_names.clone(),
+            })
+            .collect();
+        let scope = PlanScope {
+            extras: true,
+            ..PlanScope::paths(roots, None)
+        };
+        let affected = super::affected_libraries(&folders, roots, None);
+        let scoped = scanner.plan_in(
+            &affected,
+            &folders,
+            scope,
+            super::DateAdded::default(),
+            None,
+            None,
+        );
+        assert_eq!(scoped.refound, group, "the owners {path} finds extras for");
+        assert_eq!(
+            canon(scoped.items),
+            canon(expected),
+            "{path}'s refresh differs from the filtered full plan and its extras"
+        );
+        if !group.is_empty() {
+            refinding.push(path);
+        }
+    }
+    // The arm is exercised for each owner shape: a movie in its own folder,
+    // a DVD and a Blu-ray rip, a rip with a sibling trailer, a multi-disc set.
+    let root = tmp.path().to_string_lossy().into_owned();
+    for owner in [
+        "movies/Heat (1995)/Heat (1995).mkv",
+        "movies/Blade Runner (1982)",
+        "movies/Dune (2021)",
+        "movies/Jaws (1975)",
+        "movies/Sound of Music/Sound of Music (1965) (Disc 01)",
+    ] {
+        let owner = format!("{root}/{owner}");
+        assert!(
+            refinding.contains(&owner),
+            "{owner} finds no extras: {refinding:?}"
+        );
+    }
+}
+
+/// A multi-disc set's own refresh, at its first disc folder, reads the
+/// extras folder of the set's folder ([`PlanCtx::refinds_extras_in`]).
+#[tokio::test]
+async fn a_multi_disc_sets_refresh_reads_its_folders_extras_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folders = fixture(tmp.path());
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let root = tmp.path().to_string_lossy().into_owned();
+    let set = format!("{root}/movies/Sound of Music/Sound of Music (1965) (Disc 01)");
+    let trailer = format!("{root}/movies/Sound of Music/trailers/Sound of Music (1965).mkv");
+    let roots = std::slice::from_ref(&set);
+    let scoped = scanner.plan_in(
+        &super::affected_libraries(&folders, roots, None),
+        &folders,
+        PlanScope {
+            extras: true,
+            ..PlanScope::paths(roots, None)
+        },
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    assert!(
+        scoped
+            .items
+            .iter()
+            .any(|p| p.entity.path.as_deref() == Some(trailer.as_str())
+                && p.entity.extra_type.is_some()),
+        "the set's refresh plans its extras folder's trailer"
     );
 }
 

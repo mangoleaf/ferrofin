@@ -2610,6 +2610,9 @@ struct RefreshContext<'a> {
     request: RefreshRequest<'a>,
     /// The options for a planned item outside a path-scoped scan's scope.
     context: RefreshRequest<'a>,
+    /// The scan's options with `ForceSave`, for the item an item refresh
+    /// refreshed the extras of ([`PathScope::forces_save`]).
+    forced: RefreshRequest<'a>,
     /// A path-scoped scan's scope ([`PathScope`]); `None` puts every item in
     /// it.
     scope: Option<PathScope<'a>>,
@@ -2662,6 +2665,10 @@ impl<'a> RefreshContext<'a> {
             context: RefreshRequest {
                 options: run.ancestors,
                 force_save: run.ancestors.force_save,
+            },
+            forced: RefreshRequest {
+                options: run.options,
+                force_save: true,
             },
             scope: None,
             now: Utc::now(),
@@ -2736,7 +2743,9 @@ impl<'a> RefreshContext<'a> {
     /// scan planned it only for context ([`is_context`](Self::is_context)).
     /// `exists` says whether it has a stored row.
     fn request_for(&self, item: &Planned, exists: bool) -> &RefreshRequest<'a> {
-        if self.is_context(item, exists) {
+        if self.scope.is_some_and(|scope| scope.forces_save(item)) {
+            &self.forced
+        } else if self.is_context(item, exists) {
             &self.context
         } else {
             &self.request
@@ -2764,6 +2773,7 @@ impl<'a> RefreshContext<'a> {
 
 /// Which items of a path-scoped scan refresh with its options.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // independent facts of one scope, not a state machine
 struct PathScope<'a> {
     /// The scanned folders (or changed paths).
     roots: &'a [String],
@@ -2776,7 +2786,8 @@ struct PathScope<'a> {
     /// `RefreshArtist` was asked for.
     also: Option<Uuid>,
     /// Whether the rows under the roots whose files are gone are removed:
-    /// a folder's validation removes them, an item's own refresh never does.
+    /// a folder's validation removes them, an item's own refresh never does
+    /// (it removes only its gone extras, [`Self::refound`]).
     prune: bool,
     /// The planned items a covered one brings into scope: the path-less
     /// ones that sit in a folder the scope covers — a virtual season of a
@@ -2800,6 +2811,22 @@ struct PathScope<'a> {
     /// failure the scan ends with: an item's or a folder's own refresh, not
     /// the library monitor's roots.
     roots_requested: bool,
+    /// Whether the items at the roots find their extras again, beside them
+    /// and in the extras folders of the folder they sit in: an item's own
+    /// refresh (`BaseItem.RefreshMetadata` → `RefreshedOwnedItems` →
+    /// `RefreshExtras`, `BaseItem.cs:1643-1747`), which refreshes the extras
+    /// it finds when the set changed or the refresh runs in full, and
+    /// removes the ones that are gone, though it removes nothing else.
+    refinds_extras: bool,
+    /// The owners whose extras the plan found whole for that
+    /// ([`PlanOutput::refound`]): the stored extras of theirs it did not
+    /// find are removed. `None` before the plan is known.
+    refound: Option<&'a std::collections::HashSet<Uuid>>,
+    /// Whether their extras refresh with the scope's options, and the item at
+    /// the root that owns them saves whatever else changed
+    /// ([`LibraryScanner::refreshes_extras`]: `RefreshExtras` past its early
+    /// return, which `RefreshMetadata` answers with `ForceSave`).
+    refound_refresh: bool,
 }
 
 impl<'a> PathScope<'a> {
@@ -2815,7 +2842,36 @@ impl<'a> PathScope<'a> {
             regrouped: None,
             moved: None,
             roots_requested: false,
+            refinds_extras: false,
+            refound: None,
+            refound_refresh: false,
         }
+    }
+
+    /// Whether the walk found every extra of `owner`: a whole library's walk
+    /// finds every one, a path-scoped one only those of the owners it
+    /// re-found extras for ([`Self::refound`]).
+    fn found_extras_of(scope: Option<Self>, owner: Uuid) -> bool {
+        scope.is_none_or(|scope| scope.refound.is_some_and(|set| set.contains(&owner)))
+    }
+
+    /// Whether `item` is an extra that refreshes with the scope's options
+    /// ([`Self::refound_refresh`]): one of an owner the plan found its extras
+    /// again for, by its owner, whatever id the scan gave it.
+    fn refreshes_extra(&self, item: &Planned) -> bool {
+        self.refound_refresh
+            && item.entity.extra_type.is_some()
+            && owner_of(item).is_some_and(|owner| self.refound.is_some_and(|s| s.contains(&owner)))
+    }
+
+    /// Whether `item` is the refreshed item whose extras refreshed, which
+    /// `BaseItem.RefreshMetadata` refreshes with `ForceSave`
+    /// ([`Self::refound_refresh`]).
+    fn forces_save(&self, item: &Planned) -> bool {
+        self.refound_refresh
+            && item.entity.extra_type.is_none()
+            && self.refound.is_some_and(|s| s.contains(&item.id))
+            && self.is_requested(item)
     }
 
     /// This scope with its roots being what a refresh was asked for.
@@ -2848,12 +2904,14 @@ impl<'a> PathScope<'a> {
     }
 
     /// Whether `item` is in scope: below a root, at one when the roots
-    /// refresh, the extra item, an item a covered one carries, or an item
-    /// the scan moved. The folders above the roots are context.
+    /// refresh, the extra item, an item a covered one carries, an item the
+    /// scan moved, or an extra an item refresh refreshes
+    /// ([`Self::refreshes_extra`]). The folders above the roots are context.
     fn covers(&self, item: &Planned) -> bool {
         if self.also == Some(item.id)
             || self.carried.is_some_and(|set| set.contains(&item.id))
             || self.moved.is_some_and(|set| set.contains(&item.id))
+            || self.refreshes_extra(item)
         {
             return true;
         }
@@ -3118,6 +3176,12 @@ struct ItemPass<'a> {
     /// (a first refresh stays first; owner decision D1 — a provider that
     /// fails leaves it unstamped).
     music_pending: bool,
+    /// Its generated Primary is drawn by the closing passes, the last of its
+    /// providers (`RefreshWithProviders`' custom providers): the stamp is
+    /// left for that pass to write, which withholds it when the draw fails
+    /// (`RunCustomProvider`), so a scan stopped between the two leaves it
+    /// due, as for [`music_pending`](Self::music_pending).
+    draw_pending: bool,
     /// The edits recorded before its stored row was read
     /// ([`StoredRows::edit_mark`]).
     edit_mark: u64,
@@ -3141,6 +3205,10 @@ struct ItemState<'s, 'a> {
     /// its children. Its stamp is withheld until the end, except a stamp the
     /// scan could not read, which the save keeps.
     save_attempted: bool,
+    /// Set by [`LibraryScanner::scan_item`] once it decided the save: the
+    /// refresh earned its `DateLastRefreshed` stamp (no provider failed),
+    /// which a pending draw writes ([`ItemPass::draw_pending`]).
+    stamp_earned: bool,
     /// Set by [`LibraryScanner::scan_item`] when it read a playlist folder's
     /// `playlist.xml`: what the walk merges once every row is saved.
     playlist_xml: Option<playlists::PlaylistXmlRead>,
@@ -3533,6 +3601,12 @@ struct PlanScope<'a> {
     /// One more path whose item alone (not its subtree) is resolved: the
     /// artist `RefreshArtist` refreshes besides the folders it validates.
     exact: Option<&'a str>,
+    /// Whether the items at the scoped paths find their extras again
+    /// ([`PathScope::refinds_extras`]): a video at a scoped path keeps the
+    /// extras the full plan gives it and its local versions, beside it and in
+    /// the extras folders of the folder it sits in, and those alone
+    /// ([`PlanOutput::refound`]).
+    extras: bool,
 }
 
 impl<'a> PlanScope<'a> {
@@ -3540,6 +3614,7 @@ impl<'a> PlanScope<'a> {
     const ALL: PlanScope<'static> = PlanScope {
         roots: None,
         exact: None,
+        extras: false,
     };
 
     /// The items at or under `roots`, the folders above them, and the item
@@ -3548,7 +3623,18 @@ impl<'a> PlanScope<'a> {
         Self {
             roots: Some(roots),
             exact,
+            extras: false,
         }
+    }
+
+    /// Whether the owner at `path` finds its extras again: it is at a scoped
+    /// path of a scope that [`extras`](Self::extras) says so for.
+    fn refinds_extras_of(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        self.extras
+            && self
+                .roots
+                .is_some_and(|roots| roots.iter().any(|root| root.trim_end_matches('/') == path))
     }
 
     /// Whether the walk descends into `dir`: it leads to a scoped path (or to
@@ -3594,6 +3680,8 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// The owners whose extras the pass finds again ([`PlanOutput::refound`]).
+    refound: std::cell::RefCell<std::collections::HashSet<Uuid>>,
     /// What each disc rip and multi-disc set takes in whole
     /// ([`PlanOutput::rip_folds`]).
     rip_folds: std::cell::RefCell<Vec<RipFold>>,
@@ -3664,6 +3752,7 @@ impl<'a> PlanCtx<'a> {
             excluded: std::cell::RefCell::new(Vec::new()),
             superseded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
+            refound: std::cell::RefCell::new(std::collections::HashSet::new()),
             rip_folds: std::cell::RefCell::new(Vec::new()),
             prelisted: std::cell::RefCell::new(HashMap::new()),
             dot_ignore: std::cell::RefCell::default(),
@@ -3970,6 +4059,13 @@ struct PlanOutput {
     /// item whose owner the scan does not plan points at
     /// ([`LibraryScanner::reuse_stored_extra_ids`]).
     owner_paths: HashMap<Uuid, String>,
+    /// The owners whose extras the pass found whole though the scope keeps
+    /// only their own paths ([`PlanScope::extras`]): each video at a scoped
+    /// path that searches the folder it sits in for extras, and its local
+    /// versions (`GetOwnedVersionIds`) — never a version at one
+    /// (`Video.RefreshedOwnedItems` leaves a version group's extras to its
+    /// primary), nor a stacked part, which the planner gives no extras.
+    refound: std::collections::HashSet<Uuid>,
     /// What each disc rip and multi-disc set takes in whole: rows older
     /// scans stored there fold into its video or are pruned
     /// ([`LibraryScanner::fold_rip_contents`]).
@@ -4016,6 +4112,28 @@ impl PlanCtx<'_> {
             tracing::debug!(path = dir, %err, "could not list a library directory");
             unlisted.push(dir.to_owned());
         }
+    }
+
+    /// Whether the folder `dir`'s extras are found again
+    /// ([`PlanScope::extras`]): the owner the walk registered first there —
+    /// the folder's primary, which `FindExtras` runs for — is at a scoped
+    /// path. Then the walk reads the folder's extras folders, and keeps every
+    /// extra of the folder's owners.
+    fn refinds_extras_in(
+        &self,
+        dir: &str,
+        movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) -> bool {
+        self.scope.extras
+            && movies_by_dir
+                .get(dir)
+                .and_then(|owners| owners.first())
+                .is_some_and(|(primary, _)| {
+                    self.owner_paths
+                        .borrow()
+                        .get(primary)
+                        .is_some_and(|path| self.scope.refinds_extras_of(path))
+                })
     }
 
     /// Adds `item` to the plan when the scope keeps it. A path-less item — a
@@ -4303,12 +4421,13 @@ struct ScanWork<'r> {
     served: Served,
     /// The fetcher policy of an item in no library (a by-name artist).
     outside: FetcherPolicy<'r>,
-    /// The rows with a generated Primary (a photo album, folder or playlist,
-    /// [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind)) the walk
-    /// refreshed, each with whether that refresh ran every provider
-    /// (`runAllProviders`, which forces the redraw). Their providers run in
-    /// the closing passes, once the art they draw from is saved.
-    generated_images: Vec<(Uuid, bool)>,
+    /// The rows with a generated Primary (a music or photo album, folder or
+    /// playlist, [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind))
+    /// the walk refreshed, each with whether that refresh ran every provider
+    /// (`runAllProviders`, which forces the redraw) and the stamp it left to
+    /// the draw ([`ItemPass::draw_pending`]). Their providers run in the
+    /// closing passes, once the art they draw from is saved.
+    generated_images: Vec<crate::dynamic_images::RefreshedRow>,
     /// The series this scan refreshes, not those it carries for context:
     /// each one's refresh ends removing its obsolete virtual episodes
     /// ([`obsolete_episodes`]), once the walk saved every row.
@@ -4321,6 +4440,23 @@ struct ScanWork<'r> {
 }
 
 impl ScanWork<'_> {
+    /// The rows whose generated Primary the closing passes draw, with the
+    /// stamps the music pass earned and left to the draw (`left_to_draw`,
+    /// [`refresh_music`](LibraryScanner::refresh_music)), each saved.
+    fn rows_to_draw(
+        &self,
+        left_to_draw: &std::collections::HashSet<Uuid>,
+    ) -> Vec<crate::dynamic_images::RefreshedRow> {
+        self.generated_images
+            .iter()
+            .map(|&row| crate::dynamic_images::RefreshedRow {
+                stamp: row.stamp || left_to_draw.contains(&row.id),
+                saved: row.saved || left_to_draw.contains(&row.id),
+                ..row
+            })
+            .collect()
+    }
+
     /// The series the TMDb missing/unaired episode provider runs for: those
     /// the walk refreshed with their custom providers that the scan
     /// refreshes rather than carries for context.
@@ -4845,6 +4981,32 @@ impl LibraryScanner {
     ) -> Self {
         self.metadata_savers = Some(providers);
         self
+    }
+
+    /// The generated Primaries of the rows a scan refreshed, the last of
+    /// their providers ([`refresh_rows_between`](crate::dynamic_images::DynamicImageProviders::refresh_rows_between)),
+    /// then the metadata savers of each row drawn, as its `ImageUpdate` save
+    /// runs them (`SaveItemAsync`). Whether the pass read its rows; a failure
+    /// is logged.
+    async fn draw_refreshed_rows<'b>(
+        &self,
+        providers: &crate::dynamic_images::DynamicImageProviders,
+        rows: &[crate::dynamic_images::RefreshedRow],
+        between: &'b (dyn Fn() -> crate::dynamic_images::BetweenFuture<'b> + Send + Sync),
+    ) -> bool {
+        match providers.refresh_rows_between(rows, between).await {
+            Ok((_, drawn)) => {
+                for id in drawn {
+                    self.save_metadata_sidecars(id, ItemUpdateType::ImageUpdate)
+                        .await;
+                }
+                true
+            }
+            Err(err) => {
+                tracing::warn!(%err, "dynamic image pass over the refreshed rows failed");
+                false
+            }
+        }
     }
 
     async fn save_metadata_sidecars(
@@ -5656,23 +5818,13 @@ impl LibraryScanner {
             ScanTarget::Changed(paths) => Box::pin(self.scan_changed(paths, run)).await,
             ScanTarget::Items(paths) => {
                 // `RefreshSingleItem`: the items at the paths, which remove
-                // nothing when their file is gone.
-                //
-                // TODO(item refresh extras): upstream's `RefreshedOwnedItems`
-                // → `RefreshExtras` (`BaseItem.cs:1610-1700`) also re-finds a
-                // movie's extras in its containing folder (when it
-                // `SearchesContainingFolderForExtras` and its parent folder
-                // does not), refreshes them when the set changed or on
-                // FullRefresh/ReplaceAll, and deletes the extras that are
-                // gone. This plans the item's own path only, so a new
-                // `trailers/` file or `-trailer` sibling arrives with the next
-                // library or folder scan instead. To port: an owner-extras arm
-                // in `PlanScope` for these roots (visit the containing
-                // folder's extras directories, keep the extras whose owner is
-                // a kept item in `plan_movies`), covered by
-                // `plan_paths_tests`, plus a prune of only the `ExtraType`
-                // rows under that folder.
-                let scope = PathScope::of(paths, false).requested();
+                // nothing when their file is gone, and the extras each finds
+                // in the folder it sits in (`RefreshExtras`), of which the
+                // gone ones are removed.
+                let scope = PathScope {
+                    refinds_extras: true,
+                    ..PathScope::of(paths, false).requested()
+                };
                 self.scan_scoped(scope, None, paths.len(), None, run).await
             }
             ScanTarget::Artist { id, path, folders } => {
@@ -6467,11 +6619,14 @@ impl LibraryScanner {
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
-        let plan = off_runtime(|| {
+        let mut plan = off_runtime(|| {
             self.plan_in(
                 &affected,
                 &folders,
-                PlanScope::paths(roots, also_path),
+                PlanScope {
+                    extras: scope.refinds_extras,
+                    ..PlanScope::paths(roots, also_path)
+                },
                 self.date_added(),
                 Some(run.cancel),
                 run.dirs,
@@ -6500,9 +6655,15 @@ impl LibraryScanner {
         let mut carried = covered_pathless(&plan.items, scope);
         let (owned, regrouped) = covered_versions(&plan.items, scope);
         carried.extend(owned);
+        let refound = std::mem::take(&mut plan.refound);
+        let refound_refresh = self
+            .refreshes_extras(&plan.items, &refound, run.options)
+            .await;
         let scope = PathScope {
             carried: Some(&carried),
             regrouped: Some(&regrouped),
+            refound: Some(&refound),
+            refound_refresh,
             ..scope
         };
         let result = self
@@ -7096,6 +7257,8 @@ impl LibraryScanner {
             excluded,
             superseded,
             owner_paths,
+            // What the scope's caller took into the scope.
+            refound: _,
             rip_folds,
             local_versions,
             mut unlisted,
@@ -7296,6 +7459,8 @@ impl LibraryScanner {
         // ([`PathScope::is_requested`]).
         let mut target_failure: Option<ServiceError> = None;
         let targeted = |item: &Planned| scope.is_some_and(|scope| scope.is_requested(item));
+        // Whether the closing passes draw generated Primaries at all.
+        let has_image_providers = self.dynamic_image_providers().is_some();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -7329,7 +7494,7 @@ impl LibraryScanner {
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
-                self.copy_to_owned_videos(&owners, false).await;
+                self.copy_to_owned_videos(&owners, |_| false).await;
                 // A stopped walk writes no file back ([`Self::save_playlist_files`]).
                 let _ = self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
@@ -7399,6 +7564,11 @@ impl LibraryScanner {
                 ) {
                     series_keys.insert(item.id, key.clone());
                 }
+                // An extra an item's refresh found again and does not refresh
+                // takes its owner's dates (`InheritDatesFromOwner`).
+                if item.entity.extra_type.is_some() {
+                    owners.note_extra(item, false);
+                }
                 log_scoped_item(item, "context", false);
                 outcome.unchanged += 1;
                 if let Some(tracking) = run.tracking
@@ -7439,6 +7609,18 @@ impl LibraryScanner {
                 crate::refresh_plan::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
             });
+            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
+            // 922-925`), skipped for a locked item (`:785-788`) and with
+            // metadata mode `None`: the generated Primary, drawn by the
+            // closing passes. An artist's provider draws nothing
+            // (`ArtistSources`), so it is not asked.
+            let draw_pending = !locked
+                && !undecodable
+                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
+                && has_image_providers
+                && crate::dynamic_images::DynamicImageKind::for_entity(&entity).is_some_and(
+                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
+                );
             art_cache.next_episode =
                 self.next_episode_for_images(&planned, scanned + 1, &stored_rows, &refresh);
             let pass = ItemPass {
@@ -7451,6 +7633,7 @@ impl LibraryScanner {
                 locked,
                 policy,
                 music_pending,
+                draw_pending,
                 edit_mark: stored_rows.edit_mark,
             };
             let mut state = ItemState {
@@ -7461,6 +7644,7 @@ impl LibraryScanner {
                 refresh: &refresh,
                 renamed_extra: false,
                 save_attempted: false,
+                stamp_earned: false,
                 playlist_xml: None,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
@@ -7470,6 +7654,7 @@ impl LibraryScanner {
             let extra_renamed = state.renamed_extra;
             let mut playlist_xml = state.playlist_xml.take();
             let save_attempted = state.save_attempted;
+            let stamp_earned = state.stamp_earned;
             if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
             }
@@ -7574,6 +7759,7 @@ impl LibraryScanner {
                         || matches!(saved, ItemSaved::Saved),
                     owns_stamp: music_pending,
                     owns_save: false,
+                    draw: draw_pending,
                 });
             }
             // A playlist's local readers run with the rest of its refresh
@@ -7596,32 +7782,26 @@ impl LibraryScanner {
                     xml,
                 });
             }
-            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
-            // 922-925`), skipped for a locked item (`:785-788`) and with
-            // metadata mode `None`: the generated Primary, drawn by the
-            // closing passes. An artist's provider draws nothing
-            // (`ArtistSources`), so it is not asked.
+            // The draw writes the stamp the walk left it: an album's music
+            // pass hands on its own. An item edited since keeps the edit's.
             //
             // TODO(parity, open work item — NOT an accepted divergence;
-            // gl-593): the walk has already decided this row's save and stamped its
-            // `DateLastRefreshed` when the closing pass draws, so a failed
-            // draw does not withhold the stamp and a drawn image does not
-            // re-save the row, as `RunCustomProvider` and `SaveInternal` do in
-            // the same `RefreshMetadata` upstream. Un-defer path: leave these
-            // rows' stamp and save to the closing pass, as `music_pending`
-            // leaves an album's to the music pass, which stamps only a
-            // successful draw and saves on `ImageUpdate`; test it with a draw
-            // that fails.
-            if !locked
-                && !undecodable
-                && !matches!(saved, ItemSaved::Cancelled)
-                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
-                && crate::dynamic_images::DynamicImageKind::for_entity(&entity).is_some_and(
-                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
-                )
-            {
+            // gl-1993): the save is still decided before the draw, so a full
+            // refresh that changes nothing saves the row for its stamp, and a
+            // draw that then fails leaves it saved without one, where
+            // upstream's failed provider drops that save too. Fix path: skip
+            // a stamp-only save here (and in the music pass) and let the draw
+            // write the stamp with `DateLastSaved`.
+            if draw_pending && !matches!(saved, ItemSaved::Cancelled) {
                 work.generated_images
-                    .push((item.id, plan.run_all_providers));
+                    .push(crate::dynamic_images::RefreshedRow {
+                        id: item.id,
+                        force: plan.run_all_providers,
+                        stamp: stamp_earned
+                            && !music_pending
+                            && matches!(saved, ItemSaved::Saved | ItemSaved::Unchanged),
+                        saved: matches!(saved, ItemSaved::Saved),
+                    });
             }
             // `TmdbMissingEpisodeProvider`, a series' custom provider (and an
             // `IHasItemChangeMonitor`, so it runs on every refresh of a series
@@ -7656,7 +7836,7 @@ impl LibraryScanner {
                     }
                     let at = "inside an item, before its row was written";
                     self.sync_local_version_groups(&[], &released).await;
-                    self.copy_to_owned_videos(&owners, false).await;
+                    self.copy_to_owned_videos(&owners, |_| false).await;
                     // A stopped walk writes no file back ([`Self::save_playlist_files`]).
                     let _ = self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self.stop_early(
@@ -7718,7 +7898,7 @@ impl LibraryScanner {
         // and the closing passes, as one between items does.
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
-            self.copy_to_owned_videos(&owners, false).await;
+            self.copy_to_owned_videos(&owners, |_| false).await;
             // A stopped walk writes no file back ([`Self::save_playlist_files`]).
             let _ = self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
@@ -7737,9 +7917,11 @@ impl LibraryScanner {
         self.sync_local_version_groups(&resolved_groups, &released)
             .await;
         // After the groups are linked, so each local version points at its
-        // primary. A whole scan of a library found every extra of it, so an
-        // extra stored but not found is one gone.
-        self.copy_to_owned_videos(&owners, scope.is_none()).await;
+        // primary. A whole scan of a library found every extra of it, and an
+        // item's refresh every extra of the owners it found them again for,
+        // so an extra of theirs stored but not found is one gone.
+        self.copy_to_owned_videos(&owners, |owner| PathScope::found_extras_of(scope, owner))
+            .await;
         // After every row is saved, so each entry finds its item, and before
         // the closing passes, whose collage draws the members.
         if self.sync_playlists(&due_playlists, key_folders).await {
@@ -7901,7 +8083,10 @@ impl LibraryScanner {
     /// only rows that differ are written, so a quiet rescan stays quiet.
     /// Best-effort, as the version links are: a failure is logged, and the
     /// primary's next save copies again.
-    async fn copy_to_owned_videos(&self, owners: &OwnedCopies, found_all: bool) {
+    ///
+    /// `found` says of an extra's owner whether the walk found every extra of
+    /// it, so a stored one it did not find is one gone.
+    async fn copy_to_owned_videos(&self, owners: &OwnedCopies, found: impl Fn(Uuid) -> bool) {
         let mut saved = owners.saved.clone();
         saved.sort_unstable();
         saved.dedup();
@@ -7931,7 +8116,7 @@ impl LibraryScanner {
         for &(owner, extra, changed) in &owners.extras {
             let refresh = by_owner.entry(owner).or_insert_with(|| OwnerExtrasRefresh {
                 owner,
-                found: found_all.then(Vec::new),
+                found: found(owner).then(Vec::new),
                 changed: false,
             });
             refresh.changed |= changed;
@@ -7965,8 +8150,9 @@ impl LibraryScanner {
     /// path-scoped scan. `folders` are the libraries scanned and every
     /// configured one ([`Self::prune_deleted`]). Best-effort: a failure does not fail the scan. An
     /// item's own refresh removes nothing (upstream's `RefreshSingleItem`
-    /// deletes no item), and nothing at or under a directory that failed to
-    /// list (`unlisted`) is removed.
+    /// deletes no item) but the extras it found gone ([`Self::gone_extras`]),
+    /// and nothing at or under a directory that failed to list (`unlisted`)
+    /// is removed.
     async fn prune_after_scan(
         &self,
         folders: (&[VirtualFolderInfo], &[VirtualFolderInfo]),
@@ -7975,11 +8161,132 @@ impl LibraryScanner {
         unlisted: &[String],
         reconciled: (&[String], &[String], &[Uuid]),
     ) -> Vec<(Uuid, Vec<Uuid>)> {
-        if scope.is_some_and(|scope| !scope.prune) {
-            return Vec::new();
+        if let Some(scope) = scope
+            && !scope.prune
+        {
+            let gone = self.gone_extras(planned, scope).await;
+            if gone.is_empty() {
+                return Vec::new();
+            }
+            // A folder validation's prune of those paths alone, so an extra
+            // whose file is still on disk, or under a folder that failed to
+            // list, stays as it would there.
+            let scope = PathScope {
+                roots: &gone,
+                prune: true,
+                ..scope
+            };
+            return self
+                .prune_deleted(folders, planned, Some(scope), unlisted, reconciled)
+                .await;
         }
         self.prune_deleted(folders, planned, scope, unlisted, reconciled)
             .await
+    }
+
+    /// Whether an item's refresh refreshes the extras of the owners it found
+    /// them again for (`refound`), as `RefreshExtras` does unless its early
+    /// return holds: the set the plan found is the stored one, `FindExtras`
+    /// renamed none, and the refresh is neither a FullRefresh nor a
+    /// ReplaceAllMetadata. Otherwise they are read for context and take only
+    /// their owner's dates. The sets are compared by path, which a stored
+    /// extra's id an older scan derived differently keeps
+    /// ([`Self::reuse_stored_extra_ids`]); stored extras that cannot be read
+    /// count as changed, which refreshes them, as a folder validation would.
+    async fn refreshes_extras(
+        &self,
+        planned: &[Planned],
+        refound: &std::collections::HashSet<Uuid>,
+        options: &MetadataRefreshOptions,
+    ) -> bool {
+        if refound.is_empty() {
+            return false;
+        }
+        if options.replace_all_metadata
+            || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+        {
+            return true;
+        }
+        let found: HashMap<&str, &Planned> = planned
+            .iter()
+            .filter(|p| p.entity.extra_type.is_some())
+            .filter(|p| owner_of(p).is_some_and(|owner| refound.contains(&owner)))
+            .filter_map(|p| Some((p.entity.path.as_deref()?, p)))
+            .collect();
+        let owners: Vec<Uuid> = refound.iter().copied().collect();
+        let Ok(Some(links)) = self.persistence.child_links(&owners).await else {
+            tracing::debug!(
+                owners = owners.len(),
+                "could not read the stored extras; refreshing them"
+            );
+            return true;
+        };
+        let stored: HashMap<String, Uuid> = links
+            .into_iter()
+            .filter(|row| {
+                row.extra_type.is_some() && row.owner_id.is_some_and(|o| refound.contains(&o))
+            })
+            .filter_map(|row| Some((row.path?, row.id)))
+            .collect();
+        if stored.len() != found.len() || found.keys().any(|path| !stored.contains_key(*path)) {
+            return true;
+        }
+        let Some(items) = &self.item_repository else {
+            return true;
+        };
+        let ids: Vec<Uuid> = stored.values().copied().collect();
+        let (Ok(rows), Ok(locks)) = (
+            items.retrieve_items(&ids).await,
+            self.persistence.locked_fields_for_items(&ids).await,
+        ) else {
+            tracing::debug!(
+                extras = ids.len(),
+                "could not read the stored extras' names; refreshing them"
+            );
+            return true;
+        };
+        let rows: HashMap<Uuid, BaseItemEntity> = rows
+            .into_iter()
+            .filter_map(|row| Some((parse_id(&row.id)?, row)))
+            .collect();
+        found.iter().any(|(path, planned)| {
+            stored.get(*path).is_none_or(|id| {
+                rows.get(id).is_none_or(|row| {
+                    let locked = locks.get(id).map_or(&[][..], Vec::as_slice);
+                    renamed_extra(row, planned, locked).is_some()
+                })
+            })
+        })
+    }
+
+    /// The paths of the stored extras of the owners an item's refresh found
+    /// their extras again for ([`PathScope::refound`]) that it did not find:
+    /// `RefreshExtras`' `removedExtraIds`, the extras (`ExtraType` set, never
+    /// a version or a part) of the item and its local versions
+    /// (`GetOwnedVersionIds`) the walk did not plan. None when it found them
+    /// for no owner, or when they could not be read (logged).
+    async fn gone_extras(&self, planned: &[Planned], scope: PathScope<'_>) -> Vec<String> {
+        let Some(owners) = scope.refound.filter(|owners| !owners.is_empty()) else {
+            return Vec::new();
+        };
+        let ids: Vec<Uuid> = owners.iter().copied().collect();
+        let stored = match self.persistence.child_links(&ids).await {
+            Ok(stored) => stored.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(%err, owners = ids.len(), "could not read the stored extras of the refreshed items; none removed");
+                return Vec::new();
+            }
+        };
+        let found: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        stored
+            .into_iter()
+            .filter(|row| {
+                row.extra_type.is_some()
+                    && row.owner_id.is_some_and(|owner| owners.contains(&owner))
+                    && !found.contains(&row.id)
+            })
+            .filter_map(|row| row.path)
+            .collect()
     }
 
     /// Between two items: the item refreshes waiting in `run`'s lane run
@@ -8145,7 +8452,8 @@ impl LibraryScanner {
             return false;
         }
         let mut served = work.served.clone();
-        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+        let left_to_draw = self
+            .refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
             .await;
         // The TMDb missing/unaired episodes of each series it refreshed (a
         // series' own refresh is a touched scan).
@@ -8184,12 +8492,8 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 return false;
             }
-            if let Err(err) = providers
-                .refresh_rows_between(&work.generated_images, &between)
-                .await
-            {
-                tracing::warn!(%err, "dynamic image pass failed");
-            }
+            self.draw_refreshed_rows(&providers, &work.rows_to_draw(&left_to_draw), &between)
+                .await;
             let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
             // `CollectionFolderImageProvider`, of each library a library's or
             // the root's refresh validated.
@@ -8319,6 +8623,7 @@ impl LibraryScanner {
             locked,
             policy,
             music_pending,
+            draw_pending,
             edit_mark,
         } = pass;
         if matches!(stored, Stored::Undecodable) {
@@ -9153,6 +9458,7 @@ impl LibraryScanner {
             save = decision.save,
             "item refresh decided"
         );
+        state.stamp_earned = decision.stamp_refreshed;
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
         }
@@ -9426,10 +9732,11 @@ impl LibraryScanner {
         // A cancel may have cut the chapters, the subtitle downloads or the
         // trickplay short, so it leaves the row unstamped. Otherwise the
         // stamp this refresh earned is written, or the stored one is put
-        // back: a refresh with a failed provider keeps it, and an album's or
-        // artist's is the music pass's to write. Only that column: the row's
-        // save moved `DateLastSaved`, and so the Etag, once.
-        let stamp = if decision.stamp_refreshed && !music_pending {
+        // back: a refresh with a failed provider keeps it, an album's or
+        // artist's is the music pass's to write, and a row with a generated
+        // Primary the draw's. Only that column: the row's save moved
+        // `DateLastSaved`, and so the Etag, once.
+        let stamp = if decision.stamp_refreshed && !music_pending && !draw_pending {
             Some(Utc::now())
         } else {
             kept_stamp
@@ -9444,7 +9751,7 @@ impl LibraryScanner {
         if state.playlist_xml.is_none() {
             self.save_metadata_sidecars(
                 item.id,
-                if has_remote_metadata || options.force_save || options.replace_all_metadata {
+                if has_remote_metadata || request.force_save || options.replace_all_metadata {
                     ItemUpdateType::MetadataDownload
                 } else if images_changed {
                     ItemUpdateType::ImageUpdate
@@ -10147,7 +10454,7 @@ impl LibraryScanner {
     /// | first refreshes | the genres and music genres never refreshed, stamped; the root and user root too where their opening refresh cannot run; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
-    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
+    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed, forced where that refresh ran every provider (`runAllProviders`), each writing the stamp its refresh left the draw and saved when drawn; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed and logged by
@@ -10185,9 +10492,11 @@ impl LibraryScanner {
         let phase = std::time::Instant::now();
         let mut timings = PassTimings::default();
         let mut served = work.served.clone();
+        let mut left_to_draw = std::collections::HashSet::new();
         // Music: each album's and artist's providers as the walk decided.
         timings.music = post_scan_pass(music, done + 1, run.cancel, async {
-            self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            left_to_draw = self
+                .refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
                 .await;
             true
         })
@@ -10332,20 +10641,14 @@ impl LibraryScanner {
                         Box::pin(self.serve_lane(run)).await;
                     })
                 };
-            // The rows the walk refreshed with every provider redraw first;
-            // the gated pass over every other row follows.
-            let forced: Vec<(Uuid, bool)> = work
-                .generated_images
-                .iter()
-                .copied()
-                .filter(|&(_, force)| force)
-                .collect();
-            let mut succeeded = true;
-            if let Err(err) = providers.refresh_rows_between(&forced, &between).await {
-                tracing::warn!(%err, "forced dynamic image pass failed");
-                succeeded = false;
-            }
-            let drawn = forced.iter().map(|&(id, _)| id).collect();
+            // The rows the walk refreshed draw first, each forced as its
+            // refresh was, and write the stamps their refresh left them; the
+            // gated pass over every other row follows.
+            let walked = work.rows_to_draw(&left_to_draw);
+            let mut succeeded = self
+                .draw_refreshed_rows(&providers, &walked, &between)
+                .await;
+            let drawn = walked.iter().map(|row| row.id).collect();
             if let Err(err) = providers.refresh_all_between(&drawn, &between).await {
                 tracing::warn!(%err, "dynamic image pass failed");
                 succeeded = false;
@@ -16215,6 +16518,7 @@ impl LibraryScanner {
             excluded: ctx.excluded.into_inner(),
             superseded: ctx.superseded.into_inner(),
             owner_paths: ctx.owner_paths.into_inner(),
+            refound: ctx.refound.into_inner(),
             rip_folds: ctx.rip_folds.into_inner(),
             local_versions: ctx.local_versions.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
@@ -16448,6 +16752,18 @@ impl LibraryScanner {
             &mut extras,
             &mut movies_by_dir,
         );
+        // An owner at a scoped path finds its extras again
+        // (`RefreshExtras`): those of its version group, the folder's
+        // primary being what refreshes them (`Video.RefreshedOwnedItems`).
+        if ctx.scope.extras {
+            for (dir, owners) in &movies_by_dir {
+                if ctx.refinds_extras_in(dir, &movies_by_dir) {
+                    ctx.refound
+                        .borrow_mut()
+                        .extend(owners.iter().map(|(id, _)| *id));
+                }
+            }
+        }
         // `FindExtras` names an owner's extras together, so every candidate
         // is named before the scope drops any.
         let extra_names = self.movie_extra_names(&extras, &movies_by_dir, ctx);
@@ -16460,12 +16776,13 @@ impl LibraryScanner {
             named,
         ) in extras.into_iter().zip(extra_names)
         {
-            if !ctx.scope.keeps(&path) {
+            let owner = owner_for_extra(&path, &movies_by_dir, ctx.naming);
+            if !ctx.scope.keeps(&path)
+                && !owner.is_some_and(|owner| ctx.refound.borrow().contains(&owner))
+            {
                 continue;
             }
-            let (Some(owner), Some(named)) =
-                (owner_for_extra(&path, &movies_by_dir, ctx.naming), named)
-            else {
+            let (Some(owner), Some(named)) = (owner, named) else {
                 // This candidate was listed, but no eligible containing movie
                 // searches for it. Reconcile legacy rows at this exact path.
                 ctx.excluded.borrow_mut().push(path);
@@ -16534,7 +16851,9 @@ impl LibraryScanner {
     }
 
     /// Emit the same owned media shape for movies, series, physical seasons,
-    /// music artists and music albums, named as `FindExtras` names it.
+    /// music artists and music albums, named as `FindExtras` names it. The
+    /// caller has kept it: the scope keeps its path, or its owner finds its
+    /// extras again ([`PlanScope::extras`]).
     fn emit_extra(
         &self,
         path: &str,
@@ -16591,14 +16910,14 @@ impl LibraryScanner {
                 .and_then(|info| info.year)
                 .map(i64::from);
         }
-        ctx.emit(
-            out,
+        out.push(
             Planned {
                 id,
                 entity,
                 ancestors: vec![cf],
                 generated_names: generated,
-            },
+            }
+            .into(),
         );
     }
 
@@ -16627,7 +16946,8 @@ impl LibraryScanner {
     /// the owner `owner` resolved as `owner_info` (a folder's, or an
     /// episode's file): the extras folders' files and the loose extras named
     /// after it. Sort every candidate before applying scope, so type
-    /// numbering is stable. Returns the entries it took.
+    /// numbering is stable; an owner that finds its extras again
+    /// ([`PlanCtx::refound`]) keeps them all. Returns the entries it took.
     // `plan_folder_extras`' arguments plus the owner's resolved name: the
     // scan's walk state (`ctx`, `out`) and the owner's identity are separate
     // things, and every caller has them apart.
@@ -16698,8 +17018,9 @@ impl LibraryScanner {
             })
             .collect();
         let names = self.name_extras(&candidates, Some(&owner_info.name), owner_dir, ctx.naming);
+        let refound = ctx.refound.borrow().contains(&owner);
         for ((path, mixed, ..), named) in found.iter().zip(names) {
-            if ctx.scope.keeps(path) {
+            if refound || ctx.scope.keeps(path) {
                 ctx.excluded.borrow_mut().push(path.clone());
                 let first = out.len();
                 self.emit_extra(path, named, owner, cf, ctx, out);
@@ -17068,13 +17389,16 @@ impl LibraryScanner {
             groups: VideoGroups::of(videos, naming),
         };
         // The subfolders resolve independently: up to the library fanout
-        // limit at once, their rows taken back in listing order.
+        // limit at once, their rows taken back in listing order. An item's
+        // own refresh reads the extras folders of the folder it owns.
+        let refinds = ctx.refinds_extras_in(dir, movies_by_dir);
+        let visits = |entry: &FileSystemEntryInfo| {
+            ctx.scope.visits(&entry.path) || (refinds && is_extras_dir(entry, naming))
+        };
         let dirs: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                entry.type_ == FileSystemEntryType::Directory
-                    && !extras_folder
-                    && ctx.scope.visits(&entry.path)
+                entry.type_ == FileSystemEntryType::Directory && !extras_folder && visits(entry)
             })
             .collect();
         let mut children = fanout::map(&dirs, ctx, |entry, ctx| {
@@ -17102,7 +17426,7 @@ impl LibraryScanner {
                 continue;
             }
             if entry.type_ == FileSystemEntryType::Directory {
-                if ctx.scope.visits(&entry.path)
+                if visits(&entry)
                     && let Some((rows, found, owners)) = children.next()
                 {
                     out.extend(rows);
@@ -17945,7 +18269,8 @@ impl LibraryScanner {
         };
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && is_extras_dir(&entry, naming) {
-                if ctx.scope.visits(&entry.path) {
+                // A set's own refresh (at its first disc) reads them too.
+                if ctx.scope.visits(&entry.path) || ctx.refinds_extras_in(rip.dir, movies_by_dir) {
                     self.collect_movie_plan(
                         &entry.path,
                         rip.root,
@@ -18753,6 +19078,10 @@ impl LibraryScanner {
         let Some(info) = video_resolver::resolve_file(Some(&first), ctx.naming, Some(dir)) else {
             return;
         };
+        // The episode's own refresh finds its extras again (`RefreshExtras`).
+        if ctx.scope.refinds_extras_of(&first) {
+            ctx.refound.borrow_mut().insert(owner);
+        }
         self.plan_owned_extras(entries, dir, &info, owner, cf, ctx, out);
     }
 
@@ -34657,6 +34986,9 @@ mod tests {
             regrouped: None,
             moved: None,
             roots_requested: false,
+            refinds_extras: false,
+            refound: None,
+            refound_refresh: false,
         };
         let at = |id: u128, path: &str| super::Planned {
             id: uuid::Uuid::from_u128(id),
@@ -34762,6 +35094,10 @@ mod tests {
             context: super::RefreshRequest {
                 options: &defaults,
                 force_save: false,
+            },
+            forced: super::RefreshRequest {
+                options: &replace,
+                force_save: true,
             },
             scope: Some(super::PathScope::of(&roots, true)),
             now: chrono::Utc::now(),

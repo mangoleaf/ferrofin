@@ -510,6 +510,168 @@ async fn a_photo_album_refresh_redraws_its_image_as_its_options_say(
     );
 }
 
+/// Leaves the file at `path` read-only until dropped.
+struct ReadOnly(std::path::PathBuf);
+
+impl ReadOnly {
+    /// `None`, with the file as it was, where a read-only file can still be
+    /// written (running as root).
+    fn new(path: std::path::PathBuf) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let guard = Self(path);
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&guard.0)
+            .is_ok()
+        {
+            eprintln!("skipped: a read-only file is writable here (running as root?)");
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+/// The path of the row's Primary file.
+async fn primary_path(lib: &PhotoLibrary, id: uuid::Uuid) -> std::path::PathBuf {
+    lib.items
+        .get_image_infos(id)
+        .await
+        .expect("images")
+        .into_iter()
+        .find(|i| i.image_type == ImageType::Primary)
+        .expect("a Primary")
+        .path
+        .into()
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// gl-593: the generated Primary is the last of a photo album's providers, so
+/// its refresh's stamp waits for the draw (`RunCustomProvider` counts a
+/// failed draw, and `RefreshMetadata` then stamps nothing), and a drawn image
+/// saves the row even where the walk saved nothing (`SaveInternal`'s
+/// `updateType > None`): its `DateLastSaved`, and so its Etag, moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_album_refresh_stamp_waits_for_its_draw() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let album = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    let album_id = uuid::Uuid::parse_str(&album.id).expect("id");
+    let first = album
+        .date_last_refreshed
+        .expect("the first scan stamped it");
+    let path = ScanTarget::Paths(vec![lib.album_dir.to_string_lossy().into_owned()]);
+    let above = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let refresh = |mode| {
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            image_refresh_mode: mode,
+            ..MetadataRefreshOptions::default()
+        };
+        let lib = &lib;
+        let path = &path;
+        let above = &above;
+        async move {
+            let cancel = ScanCancel::new();
+            lib.scanner
+                .scan_target(
+                    path,
+                    ScanRun::new(&options, above, &cancel).with_passes(ScanPasses::Touched),
+                )
+                .await
+                .expect("refresh");
+        }
+    };
+
+    // A full refresh whose draw cannot replace the album's image file.
+    let primary = primary_path(&lib, album_id).await;
+    {
+        let Some(_guard) = ReadOnly::new(primary.clone()) else {
+            return;
+        };
+        refresh(MetadataRefreshMode::FullRefresh).await;
+    }
+    let failed = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    assert_eq!(
+        failed.date_last_refreshed,
+        Some(first),
+        "a failed draw withholds the stamp"
+    );
+
+    // The same refresh, drawn.
+    refresh(MetadataRefreshMode::FullRefresh).await;
+    let drawn = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    assert!(drawn.date_last_refreshed.expect("stamped") > first);
+
+    // A default refresh that changes nothing but the image it draws: the
+    // album lost its Primary, file and all, so the gate opens.
+    lib.persistence
+        .save_item_images(album_id, &[])
+        .await
+        .expect("drop the primary");
+    std::fs::remove_file(&primary).expect("remove the file");
+    refresh(MetadataRefreshMode::Default).await;
+    let redrawn = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::PhotoAlbum, "Trip").await,
+        RED
+    );
+    assert!(
+        redrawn.date_last_saved > drawn.date_last_saved,
+        "the drawn image saved the row"
+    );
+    assert!(
+        redrawn.date_last_refreshed > drawn.date_last_refreshed,
+        "with the stamp the refresh earned"
+    );
+}
+
+/// gl-593: library validation draws the photo albums its walk refreshed in
+/// its closing passes too, so a full-refresh validation whose album draw
+/// fails leaves the album as last refreshed, and the next one stamps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_validation_withholds_the_stamp_of_a_failed_album_draw() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let album = lib.row(BaseItemKind::PhotoAlbum, "Trip").await;
+    let album_id = uuid::Uuid::parse_str(&album.id).expect("id");
+    let first = album.date_last_refreshed.expect("stamped");
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    {
+        let Some(_guard) = ReadOnly::new(primary_path(&lib, album_id).await) else {
+            return;
+        };
+        lib.scanner.scan_with(None, &full).await.expect("scan");
+    }
+    assert_eq!(
+        lib.row(BaseItemKind::PhotoAlbum, "Trip")
+            .await
+            .date_last_refreshed,
+        Some(first),
+        "a failed draw withholds the stamp"
+    );
+    lib.scanner.scan_with(None, &full).await.expect("scan");
+    assert!(
+        lib.row(BaseItemKind::PhotoAlbum, "Trip")
+            .await
+            .date_last_refreshed
+            .expect("stamped")
+            > first
+    );
+}
+
 /// gl-590: a Primary uploaded to a photo album whose library does not save
 /// local metadata stays in the album's internal folder, as upstream's does,
 /// and a default rescan finds it current and leaves it alone.

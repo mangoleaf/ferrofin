@@ -99,6 +99,8 @@ pub(super) fn owns_providers(short: &str) -> bool {
 
 /// One album or artist this scan owes a music refresh, with the decision
 /// the walk took for it.
+// One flag per part of the refresh the walk hands this pass or the next.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub(super) struct MusicRefresh<'r> {
     /// The item.
@@ -131,6 +133,10 @@ pub(super) struct MusicRefresh<'r> {
     /// This pass decides whether the item is saved at all (`SaveInternal`):
     /// no walk refreshed it (a by-name artist).
     pub(super) owns_save: bool,
+    /// Its generated Primary is drawn after this pass, the last of its
+    /// providers: the stamp this pass earns is left to the draw, which
+    /// withholds it when the draw fails ([`refresh_music`](LibraryScanner::refresh_music)).
+    pub(super) draw: bool,
 }
 
 /// Which of the music providers one refresh runs.
@@ -560,15 +566,19 @@ impl LibraryScanner {
     /// ([`Self::set_album_people`]), a sweep that does not serve the lane.
     /// An album in `album_gains` (its tracks' `REPLAYGAIN_ALBUM_GAIN`, read
     /// by this scan's probes) is due, and takes the gain if it has none.
+    ///
+    /// Returns the albums whose stamp this pass earned and left to their draw
+    /// ([`MusicRefresh::draw`]), each saved.
     pub(super) async fn refresh_music(
         &self,
         work: &[MusicRefresh<'_>],
         album_gains: &HashMap<Uuid, f64>,
         run: ScanRun<'_>,
         served: &mut Served,
-    ) {
+    ) -> HashSet<Uuid> {
+        let mut left_to_draw = HashSet::new();
         if self.item_repository.is_none() {
-            return;
+            return left_to_draw;
         }
         let mut skipped = super::SkippedItems::default();
         // The pass's parent reads for the metadata locale: an unreadable
@@ -605,6 +615,7 @@ impl LibraryScanner {
                     run.cancel,
                     &mut skipped,
                     &mut locales,
+                    &mut left_to_draw,
                 ))
                 .await
                 {
@@ -617,6 +628,7 @@ impl LibraryScanner {
             }
         }
         skipped.report("music");
+        left_to_draw
     }
 
     /// The close of `MusicAlbum.RefreshAllMetadata` (`MusicAlbum.cs:212-236`):
@@ -879,6 +891,7 @@ impl LibraryScanner {
                 aggregate: full_refresh(&plan, &request),
                 owns_stamp: true,
                 owns_save: true,
+                draw: false,
             };
             if let Err(err) = Box::pin(self.refresh_music_item(
                 &work,
@@ -886,6 +899,7 @@ impl LibraryScanner {
                 run.cancel,
                 &mut skipped,
                 &mut locales,
+                &mut HashSet::new(),
             ))
             .await
             {
@@ -955,6 +969,7 @@ impl LibraryScanner {
             aggregate: full_refresh(&plan, &request),
             owns_stamp: true,
             owns_save: true,
+            draw: false,
         };
         let mut skipped = super::SkippedItems::default();
         let saved = Box::pin(self.refresh_music_item(
@@ -963,6 +978,7 @@ impl LibraryScanner {
             run.cancel,
             &mut skipped,
             &mut Box::<super::ArtworkCache>::default(),
+            &mut HashSet::new(),
         ))
         .await;
         skipped.report("artist refresh");
@@ -1005,6 +1021,7 @@ impl LibraryScanner {
         cancel: &ScanCancel,
         skipped: &mut super::SkippedItems,
         locales: &mut super::ArtworkCache,
+        left_to_draw: &mut HashSet<Uuid>,
     ) -> Result<Option<bool>, ServiceError> {
         use ferrofin_providers::rate_limit::{count_request_failures, for_item};
         let Some(items) = &self.item_repository else {
@@ -1295,12 +1312,15 @@ impl LibraryScanner {
         if let Some(images) = images {
             self.persistence.save_item_images(work.id, &images).await?;
         }
-        if stamp {
+        if stamp && !work.draw {
             row.date_last_refreshed = Some(Utc::now());
         }
         self.persistence
             .save_items(std::slice::from_ref(&row))
             .await?;
+        if stamp && work.draw {
+            left_to_draw.insert(work.id);
+        }
         self.save_metadata_sidecars(
             work.id,
             if answered || work.request.force_save || work.request.options.replace_all_metadata {
@@ -2106,6 +2126,7 @@ impl LibraryScanner {
                 aggregate: true,
                 owns_stamp: remote,
                 owns_save: kind == MusicKind::ByNameArtist,
+                draw: false,
             })
             .collect();
         self.refresh_music(
