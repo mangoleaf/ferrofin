@@ -3230,14 +3230,18 @@ impl LibraryManager for FerrofinLibraryManager {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
         }
-        // A refresh holds the item from loading its row to its last save
-        // (`ProviderManager::lock_item_metadata`), and its save inserts a row
-        // that is gone: wait it out, and hold the next one off until the row
-        // and folder are deleted, so no provider refresh writes them back
-        // (gl-1577).
+        // A refresh holds the item from its start to its last save
+        // (`ProviderManager::lock_item_refresh`): it writes images into the
+        // item's folder, and its save inserts a row that is gone. Wait it out,
+        // and keep the next refresh, and an edit or its cascade
+        // (`ProviderManager::lock_item_metadata`), off until the row and
+        // folder are deleted, so none writes them back (gl-1577).
         // Upstream has the same window; its scan later drops the orphan.
-        let _metadata = match &self.providers {
-            Some(providers) => Some(providers.lock_item_metadata(id).await),
+        let _locks = match &self.providers {
+            Some(providers) => Some((
+                providers.lock_item_refresh(id).await,
+                providers.lock_item_metadata(id).await,
+            )),
             None => None,
         };
         let Some(row) = self.items.retrieve_item(id).await? else {
@@ -7017,11 +7021,17 @@ mod tests {
         assert!(mgr.get_item_by_id(id).await.expect("read").is_none());
     }
 
-    /// gl-1577: a refresh holds its item from loading the row to its last
+    /// gl-1577: a refresh holds its item from its start to its last save
+    /// (`ProviderManager::lock_item_refresh`), and an edit around its read and
     /// save (`ProviderManager::lock_item_metadata`). A delete made meanwhile
-    /// waits for it, so the refresh cannot save the deleted item back.
+    /// waits for either, so neither saves the deleted item back.
+    #[rstest::rstest]
+    #[case::refresh(true)]
+    #[case::edit(false)]
     #[tokio::test]
-    async fn delete_item_waits_for_a_running_refresh_of_the_item() {
+    async fn delete_item_waits_for_a_running_refresh_or_edit_of_the_item(
+        #[case] refresh_lock: bool,
+    ) {
         use ferrofin_traits::providers::ProviderManager as _;
         let db = test_db().await;
         let id = Uuid::from_u128(0x1577);
@@ -7029,20 +7039,24 @@ mod tests {
         let providers = Arc::new(ferrofin_providers::LocalProviderManager::default());
         let mgr = Arc::new(manager(&db).with_providers(providers.clone()));
 
-        // The refresh loads the row, the delete is made while it runs…
-        let refresh = providers.lock_item_metadata(id).await;
+        // The writer loads the row, the delete is made while it runs…
+        let writer = if refresh_lock {
+            providers.lock_item_refresh(id).await
+        } else {
+            providers.lock_item_metadata(id).await
+        };
         let loaded = mgr.get_item_by_id(id).await.expect("read").expect("row");
         let mut delete = tokio::spawn({
             let mgr = Arc::clone(&mgr);
             async move { mgr.delete_item(id, &DeleteOptions::default()).await }
         });
         let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut delete).await;
-        // …then the refresh saves the row it loaded and lets go.
+        // …then the writer saves the row it loaded and lets go.
         FerrofinItemPersistenceService::new(db.clone())
             .save_items(std::slice::from_ref(&loaded))
             .await
-            .expect("the refresh's save");
-        drop(refresh);
+            .expect("the writer's save");
+        drop(writer);
         let waited = early.is_err();
         match early {
             Ok(joined) => joined,
@@ -7052,9 +7066,9 @@ mod tests {
         .expect("delete");
         assert!(
             mgr.get_item_by_id(id).await.expect("read").is_none(),
-            "the refresh's save brought the deleted item back"
+            "the writer's save brought the deleted item back"
         );
-        assert!(waited, "the delete ran while the refresh held the item");
+        assert!(waited, "the delete ran while the writer held the item");
     }
 
     #[tokio::test]

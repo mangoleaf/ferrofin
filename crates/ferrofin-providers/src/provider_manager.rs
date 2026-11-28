@@ -1266,6 +1266,11 @@ pub struct LocalProviderManager {
     /// Per-item locks on a row's read-modify-write, shared by every clone
     /// ([`ProviderManager::lock_item_metadata`]).
     item_metadata_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
+    /// Per-item locks a single-item refresh holds throughout, so two
+    /// refreshes of one item (the queue's and an Identify's) never read and
+    /// save its images over each other, and a delete waits for a running one
+    /// ([`ProviderManager::lock_item_refresh`]); an edit never takes them.
+    item_refresh_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
     /// A box set's `collection.xml` and a playlist folder's `playlist.xml`
     /// saver (`BoxSetXmlSaver`, `PlaylistXmlSaver`); with it their refresh
@@ -1452,6 +1457,7 @@ impl std::fmt::Debug for LocalProviderManager {
                     .map_or(0, |queue| queue.items.len()),
             )
             .field("locked_items", &self.item_metadata_locks.len())
+            .field("refreshing_items", &self.item_refresh_locks.len())
             .field("external_id_infos", &self.external_id_infos)
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field(
@@ -1572,6 +1578,7 @@ impl LocalProviderManager {
         Self {
             refresh_queue: Arc::default(),
             item_metadata_locks: Arc::default(),
+            item_refresh_locks: Arc::default(),
             nfo_saver: None,
             container_xml: None,
             image_saver: None,
@@ -2904,16 +2911,21 @@ impl LocalProviderManager {
         item_id: Uuid,
         options: &MetadataRefreshOptions,
         identified: bool,
+        replay: Option<RefreshReplay>,
     ) -> Result<ItemUpdateType, ServiceError> {
         use crate::metadata_merge::{
             MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
         };
-        // Held from the id write and the load below to the last save, so an
-        // edit made meanwhile waits and then applies to the saved row. It
-        // spans the remote fetches too, so the edit waits for them, minutes at
-        // worst under `rate_limit.rs`'s timeouts and retries; gl-1961 has the
-        // re-read-under-the-lock shape that would end that wait.
-        let _metadata = self.lock_item_metadata(item_id).await;
+        // The item's metadata lock. A first pass takes it only after its
+        // fetches, to read the row again before it saves, so an edit never
+        // waits for a provider; a pass merging onto a changed row fetches
+        // nothing and holds it throughout. The first pass holds the item's
+        // refresh lock throughout, for itself and its replay.
+        let (_refresh, replay_lock) = if replay.is_some() {
+            (None, Some(self.lock_item_metadata(item_id).await))
+        } else {
+            (Some(self.lock_item_refresh(item_id).await), None)
+        };
         // "Identify → Apply": the chosen result's ids become the item's, and
         // they are persisted BEFORE anything else — including every gate and
         // early return below. C# does this in the CONTROLLER, outside the
@@ -2922,7 +2934,9 @@ impl LocalProviderManager {
         // (`ItemLookupController.ApplySearchCriteria`). Its `SaveInternal`
         // then always writes, because `ReplaceAllMetadata` is set. So Apply on
         // a LOCKED item, or in a library with every metadata downloader
-        // unticked, still records the ids the user chose.
+        // unticked, still records the ids the user chose. A pass merging onto
+        // a changed row writes them no second time: an edit may have changed
+        // them since.
         let chosen_ids = crate::metadata_merge::set_provider_ids(
             options
                 .search_result
@@ -2932,7 +2946,7 @@ impl LocalProviderManager {
                 .flatten()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
-        let identified = identified && options.search_result.is_some();
+        let identified = identified && options.search_result.is_some() && replay.is_none();
         if identified && let Some(store) = &self.image_store {
             store.replace_provider_ids(item_id, &chosen_ids).await?;
         }
@@ -2950,9 +2964,14 @@ impl LocalProviderManager {
         // refreshOptions.ReplaceAllImages) ImageProvider.RemoveImages(item)`
         // (`MetadataService.cs:112-118`): before every provider, whatever the
         // lock or the modes.
-        let removed_images = options.remove_old_metadata
-            && options.replace_all_images
-            && self.remove_own_images(item_id, &stored).await?;
+        let removed_images = match &replay {
+            Some(replay) => replay.removed_images,
+            None => {
+                options.remove_old_metadata
+                    && options.replace_all_images
+                    && self.remove_own_images(item_id, &stored).await?
+            }
+        };
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if identified {
@@ -2983,7 +3002,9 @@ impl LocalProviderManager {
         // A failed validation is logged and the refresh goes on without the
         // remote image providers, unstamped (`localImagesFailed`,
         // `MetadataService.cs:127-143,195-198`).
-        let (local_images, local_images_failed) = if saves_local_and_replaces {
+        let (local_images, local_images_failed) = if let Some(replay) = &replay {
+            replay.local_images
+        } else if saves_local_and_replaces {
             (false, false)
         } else {
             match self.validate_virtual_season_images(item_id, &stored).await {
@@ -3060,7 +3081,7 @@ impl LocalProviderManager {
             .and_then(|r| r.name.as_deref())
             .map(str::trim)
             .filter(|n| !n.is_empty());
-        let target = if fetch.metadata {
+        let target = if fetch.metadata && replay.is_none() {
             self.resolve_refresh_target(items, &stored).await?
         } else {
             None
@@ -3082,7 +3103,7 @@ impl LocalProviderManager {
         // The fetch, with its provider failures counted: a provider that
         // failed keeps the refresh from being stamped, one that found nothing
         // does not (owner decision D1, `RefreshResult.Failures`).
-        let (fetched, mut failures) = match target {
+        let (fetched, failures) = match target {
             Some(RefreshTarget::Season {
                 series_id,
                 season_number,
@@ -3168,8 +3189,13 @@ impl LocalProviderManager {
             },
             None => (None, 0),
         };
-        failures += u32::from(local_images_failed);
-        let fetched = fetched.unwrap_or_default();
+        // A pass merging onto a changed row takes the first pass's answers.
+        let (fetched, fetch_failures) = match &replay {
+            Some(replay) => (replay.fetched.clone(), replay.fetch_failures),
+            None => (fetched.unwrap_or_default(), failures),
+        };
+        let answers = replay.is_none().then(|| fetched.clone());
+        let mut failures = fetch_failures + u32::from(local_images_failed);
         // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
         // scores its members' ratings (`UpdateOfficialRating`) against its
         // `GetPreferredMetadataCountryCode()`.
@@ -3397,7 +3423,8 @@ impl LocalProviderManager {
         // (`runAllProviders`) or when its `HasChanged` gate opens.
         let generated = match &self.generated_images {
             Some(provider)
-                if !stored.is_locked
+                if replay.is_none()
+                    && !stored.is_locked
                     && options.metadata_refresh_mode != MetadataRefreshMode::None =>
             {
                 match provider
@@ -3415,7 +3442,7 @@ impl LocalProviderManager {
             }
             _ => false,
         };
-        let image_saved = if fetch.images && self.image_store.is_some() {
+        let image_saved = if replay.is_none() && fetch.images && self.image_store.is_some() {
             let (saved, image_failures) = Box::pin(crate::rate_limit::count_request_failures(
                 self.refresh_ordered_images(
                     item_id,
@@ -3433,6 +3460,47 @@ impl LocalProviderManager {
             saved?
         } else {
             false
+        };
+        // Upstream merges onto the cached item, which an edit made during the
+        // fetches above has already changed, and saves that. Here the row is
+        // read again under the lock, which is then held to the last save: if
+        // an edit (or the cascade of one, or any other writer) changed the
+        // row, its `LockedFields` or its ids since it was read, the pass runs
+        // again from that row with these answers, fetching nothing. A row
+        // deleted meanwhile is not saved back.
+        let _metadata = if let Some(held) = replay_lock {
+            held
+        } else {
+            let held = self.lock_item_metadata(item_id).await;
+            let Some(current) = items.retrieve_item(item_id).await? else {
+                return Err(ServiceError::not_found(format!("item {item_id}")));
+            };
+            if current != stored
+                || self.stored_locked_fields(item_id).await != locked_fields
+                || !same_pairs(&self.stored_provider_ids(item_id).await, &stored_ids)
+            {
+                drop(held);
+                tracing::debug!(%item_id, "item changed during its refresh: merging onto the changed row");
+                let replay = RefreshReplay {
+                    fetched: answers.unwrap_or_default(),
+                    fetch_failures,
+                    removed_images,
+                    local_images: (local_images, local_images_failed),
+                    generated,
+                    image_saved,
+                    failures,
+                };
+                return Box::pin(self.refresh_item(item_id, options, identified, Some(replay)))
+                    .await;
+            }
+            held
+        };
+        let (generated, image_saved) = match &replay {
+            Some(replay) => {
+                failures = replay.failures;
+                (replay.generated, replay.image_saved)
+            }
+            None => (generated, image_saved),
         };
         // `EpisodeMetadataService.BeforeSaveInternal`'s range guard, on the
         // path-less episodes this refresh saves (an adopted row can carry an
@@ -4329,7 +4397,7 @@ const NO_FILE: FileFacts = FileFacts {
 /// What a provider arm of the single-item refresh returned: upstream's
 /// `MetadataResult` of a remote provider (the item fields it sets and its ids,
 /// `None` when metadata was not asked for or it had nothing).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Fetched {
     /// The provider result's row: only the fields the provider sets.
     item: Option<BaseItemEntity>,
@@ -4339,6 +4407,36 @@ struct Fetched {
     /// null list), which [`pass_credits`](crate::metadata_merge::pass_credits)
     /// folds.
     credits: Vec<Option<Vec<ferrofin_db::entities::base_items::PeopleEntity>>>,
+}
+
+/// What a single-item refresh did before it read its row again and found it
+/// changed ([`LocalProviderManager::refresh_item`]). The pass that merges onto
+/// the changed row reuses it, so no provider runs twice and no image is
+/// removed, validated or written twice.
+struct RefreshReplay {
+    /// The metadata providers' answers.
+    fetched: Fetched,
+    /// Their failures.
+    fetch_failures: u32,
+    /// Whether `RemoveOldMetadata` removed the item's images.
+    removed_images: bool,
+    /// The local image validation: saved, failed.
+    local_images: (bool, bool),
+    /// Whether the generated image was saved.
+    generated: bool,
+    /// Whether the image providers saved an image.
+    image_saved: bool,
+    /// Every failure the pass counted, the image providers' included.
+    failures: u32,
+}
+
+/// Whether two id sets hold the same pairs, in any order.
+fn same_pairs(a: &[(String, String)], b: &[(String, String)]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// What [`LocalProviderManager::fetch_season_providers`] looks a season up
@@ -5743,7 +5841,7 @@ impl ProviderManager for LocalProviderManager {
         // result was chosen for.
         Box::pin(crate::rate_limit::for_item(
             item_id,
-            self.refresh_item(item_id, options, true),
+            self.refresh_item(item_id, options, true, None),
         ))
         .await
         .map(|_| ())
@@ -5761,13 +5859,20 @@ impl ProviderManager for LocalProviderManager {
         // Identify's result in `options` is its series'.
         Box::pin(crate::rate_limit::for_item(
             item_id,
-            self.refresh_item(item_id, options, false),
+            self.refresh_item(item_id, options, false, None),
         ))
         .await
     }
 
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         self.item_metadata_locks
+            .get(&item_id.to_string())
+            .lock_owned()
+            .await
+    }
+
+    async fn lock_item_refresh(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.item_refresh_locks
             .get(&item_id.to_string())
             .lock_owned()
             .await
@@ -11312,6 +11417,8 @@ mod tests {
         while mgr.refresh_queue.lock().unwrap().processing {
             tokio::task::yield_now().await;
         }
+        // The first refresh read its row again before its save.
+        while rx.try_recv().is_ok() {}
         mgr.queue_refresh(ids[1], &options, RefreshPriority::Low)
             .await
             .unwrap();
@@ -14250,8 +14357,9 @@ mod tests {
         }
     }
 
-    /// A refresh holds the item's metadata lock from its load to its save, so
-    /// an edit waits for it and lands on the saved row instead of under it
+    /// A refresh holds the item's metadata lock from its re-read after its
+    /// fetches to its save, so an edit waits for that save and lands on the
+    /// saved row instead of under it
     /// (gl-1852: a box set's edited Overview was lost to the refresh a
     /// membership change had queued).
     #[tokio::test]
@@ -14294,6 +14402,61 @@ mod tests {
             saved_before_the_edit > 0,
             "the edit took the lock while the refresh was still saving"
         );
+    }
+
+    /// Two refreshes of one item run one after the other (its refresh lock),
+    /// so neither reads and saves the item's images over the other's, while
+    /// an edit, which takes only the metadata lock, waits for neither's
+    /// fetches (gl-1961).
+    #[tokio::test]
+    async fn a_refresh_waits_for_another_refresh_of_its_item_but_an_edit_does_not() {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Saga");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_linked_children(Arc::new(Members(Vec::new())));
+        // Another refresh of the item is running.
+        let running = mgr
+            .item_refresh_locks
+            .get(&item_id.to_string())
+            .lock_owned()
+            .await;
+        let refresh = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.refresh_full_item(item_id, &force_save()).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.saved.lock().expect("lock").is_empty(),
+            "the refresh ran beside the other one"
+        );
+        let edit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mgr.lock_item_metadata(item_id),
+        )
+        .await;
+        assert!(edit.is_ok(), "an edit waited for a refresh's lock");
+        drop(edit);
+        drop(running);
+        tokio::time::timeout(std::time::Duration::from_secs(5), refresh)
+            .await
+            .expect("the refresh ran once the other was done")
+            .expect("join")
+            .expect("refresh succeeds");
+        assert!(!store.saved.lock().expect("lock").is_empty());
     }
 
     /// `is_processing_refresh_queue` (`_isProcessingRefreshQueue`) reads true
@@ -17262,13 +17425,18 @@ mod tests {
         .await
         .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while store.culture_reads.lock().unwrap().len() < 2 {
+            while store.culture_reads.lock().unwrap().len() < 2
+                || mgr.is_processing_refresh_queue().await
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(*store.culture_reads.lock().unwrap(), ["sv", "sv"]);
+        // Each read records the culture before and after an await; the
+        // refresh reads the ids at its start and again before its save.
+        let reads = store.culture_reads.lock().unwrap().clone();
+        assert!(reads.iter().all(|culture| culture == "sv"), "{reads:?}");
     }
 
     #[tokio::test]
