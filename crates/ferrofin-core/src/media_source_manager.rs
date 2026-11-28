@@ -292,8 +292,9 @@ impl FerrofinMediaSourceManager {
     /// `GetStaticMediaSources(item, enablePathSubstitution, user)`: the trait's
     /// [`get_static_media_sources`](MediaSourceManager::get_static_media_sources), over the
     /// item's row and the user's row when the caller has read them already (`known`, `user`).
-    /// `read_timestamps` (PlaybackInfo only: nothing on the streaming, session or
-    /// DTO paths reads the value) reads each local TS/M2TS source's `Timestamp`.
+    /// `read_timestamps` (PlaybackInfo only: the streaming, session and DTO
+    /// paths take the stored value alone) reads the `Timestamp` of each local
+    /// TS/M2TS source whose row stores none from its file.
     async fn static_sources(
         &self,
         item_id: Uuid,
@@ -908,6 +909,9 @@ impl FerrofinMediaSourceManager {
             video_type: format.map(|f| f.video_type),
             iso_type: format.and_then(|f| f.iso_type),
             video3d_format: format.and_then(|f| f.video3d_format),
+            // `info.Timestamp = video.Timestamp` (`BaseItem.cs:1261`).
+            timestamp: format
+                .and_then(|_| crate::item_data::stored_timestamp(item.data.as_deref())),
             default_audio_stream_index,
             e_tag: Some(source_etag(item)),
             // `BaseItem.GetVersionInfo` seeds the source bitrate from the item's
@@ -1377,16 +1381,25 @@ async fn resolve_symlink_paths(sources: &mut [MediaSourceInfo], enable_path_subs
     }
 }
 
-/// `GetVersionInfo`'s `Timestamp = video.Timestamp`: upstream's probe sets it
-/// on the in-memory item and never persists it, so PlaybackInfo reads it from
-/// each local TS/M2TS source's file. The container is the probed one
-/// (`BaseItem.Container`), as upstream's guard sees it, else the extension.
+/// `GetVersionInfo`'s `Timestamp = video.Timestamp` for a source whose row
+/// stores none: the probe stores it in `Data` (`FFProbeVideoInfo.cs:247`,
+/// which [`FerrofinMediaSourceManager::static_source`] copies), but a row Ferrofin
+/// probed before it stored the value (gl-2037) has none, so PlaybackInfo reads
+/// it from each such local TS/M2TS source's file. The container is the probed
+/// one (`BaseItem.Container`), as upstream's guard sees it, else the extension.
+///
+/// TODO(parity, gl-2040): once those rows have their value (the owner picks how:
+/// a scan-time re-probe, a boot repair or an export-side read), PlaybackInfo
+/// takes the stored value alone, as `GetVersionInfo` does, and this read goes.
 async fn read_source_timestamps(
     item_id: Uuid,
     group: &[(&BaseItemEntity, MediaSourceType)],
     sources: &mut [MediaSourceInfo],
 ) {
-    for source in sources {
+    for source in sources
+        .iter_mut()
+        .filter(|source| source.timestamp.is_none())
+    {
         let container = group
             .iter()
             .find(|(row, _)| row.path == source.path)
@@ -2694,13 +2707,13 @@ mod tests {
         crate::test_support::save_item(db, &entity).await;
     }
 
-    /// `BaseItem.GetVersionInfo` copies `Video.Timestamp`, which upstream's
-    /// probe (`ExtractTimestamp`) sets on the in-memory item and never
-    /// persists. PlaybackInfo reads it from a local TS/M2TS video's file, before
-    /// path substitution rewrites the path, judging the container by the probed
-    /// one when the item has it; a remote source (jellyfin/jellyfin#16290), a
-    /// missing file and the static sources the streaming paths read are never
-    /// given one.
+    /// `BaseItem.GetVersionInfo` copies `Video.Timestamp`, the value the probe
+    /// (`ExtractTimestamp`) stored in `Data`, onto every source (gl-2037). For a
+    /// row with none stored, PlaybackInfo reads it from a local TS/M2TS video's
+    /// file, before path substitution rewrites the path, judging the container
+    /// by the probed one when the item has it; a remote source
+    /// (jellyfin/jellyfin#16290), a missing file and the static sources the
+    /// streaming paths read are never given one that way.
     #[tokio::test]
     async fn playback_reports_a_local_m2ts_sources_transport_stream_timestamp() {
         use ferrofin_model::media_info::TransportStreamTimestamp;
@@ -2722,7 +2735,7 @@ mod tests {
             )
             .await,
         );
-        let ids: Vec<Uuid> = (0x311..0x316).map(Uuid::from_u128).collect();
+        let ids: Vec<Uuid> = (0x311..0x317).map(Uuid::from_u128).collect();
         seed_strm(&db, ids[0], &format!("{dir}/clip.m2ts"), "{}").await;
         seed_strm(&db, ids[1], &format!("{dir}/clip.mkv"), "{}").await;
         // AVCHD: the extension is `mts`, the probed container `ts`.
@@ -2767,6 +2780,24 @@ mod tests {
             .await
             .expect("sources");
         assert_eq!(streamed[0].timestamp, None);
+
+        // A probed row's stored value wins over the file's header, everywhere.
+        seed_strm(
+            &db,
+            ids[5],
+            &format!("{dir}/clip.m2ts"),
+            r#"{"Container":"m2ts","Timestamp":"Zero"}"#,
+        )
+        .await;
+        assert_eq!(
+            played(ids[5]).await.timestamp,
+            Some(TransportStreamTimestamp::Zero)
+        );
+        let streamed = mgr
+            .get_static_media_sources(ids[5], false, None)
+            .await
+            .expect("sources");
+        assert_eq!(streamed[0].timestamp, Some(TransportStreamTimestamp::Zero));
     }
 
     /// `GetVersionInfo`'s `Path = enablePathSubstitution ? GetMappedPath(...)`

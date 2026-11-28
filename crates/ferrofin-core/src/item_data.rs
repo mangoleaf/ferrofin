@@ -306,8 +306,8 @@ pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) 
 }
 
 /// The `Data` keys the media probe owns: `Container` (`FFProbeVideoInfo.cs:206`,
-/// `AudioFileProber.cs:138`), a video's `DefaultVideoStreamIndex` and
-/// `HasSubtitles` (`FFProbeVideoInfo.cs:268-270`), a track's `LyricFiles`
+/// `AudioFileProber.cs:138`), a video's `Timestamp`, `DefaultVideoStreamIndex`
+/// and `HasSubtitles` (`FFProbeVideoInfo.cs:247,268-270`), a track's `LyricFiles`
 /// (`AudioFileProber.cs:584`) and a `.strm` item's `ShortcutPath`
 /// (`ProbeProvider.FetchShortcutInfo`). Upstream's probe is a pre-refresh
 /// provider, run before a refresh's lock check (`MetadataService.cs:780-788`),
@@ -315,12 +315,13 @@ pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) 
 /// file too. No user edits any of them. Each holds a scalar or a list: a
 /// locked row's save sets them whole with a merge patch, which would merge an
 /// object instead.
-pub const PROBE_OWNED_KEYS: [&str; 5] = [
+pub const PROBE_OWNED_KEYS: [&str; 6] = [
     "Container",
     "DefaultVideoStreamIndex",
     "HasSubtitles",
     "LyricFiles",
     "ShortcutPath",
+    "Timestamp",
 ];
 
 /// The one [`PROBE_OWNED_KEYS`] entry a probe removes when it finds none: a
@@ -336,7 +337,9 @@ pub const PROBE_CLEARED_KEY: &str = "LyricFiles";
 /// [`PROBE_CLEARED_KEY`], whose absence is the probe's answer (a row a scan
 /// read carries its stored list unless the probe cleared it, and one it could
 /// not read loses the list only until the lyric check re-probes it). Every
-/// other key is kept.
+/// other key is kept. A probe that found no `Timestamp` sends a JSON `null`
+/// only over a stored row the scan read (`overlay_probe_data`), so a row it
+/// could not read keeps its stored timestamp until its next probe.
 ///
 /// `None` when that changes nothing, or either blob is not a JSON object (an
 /// empty or absent `stored` is an empty object). The SQL twin is the
@@ -527,6 +530,17 @@ pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -
 pub fn stored_container(data: Option<&str>) -> Option<String> {
     let text = data.filter(|text| text.contains("\"Container\""))?;
     read_data_string(&parse_data(Some(text)), "Container").filter(|c| !c.is_empty())
+}
+
+/// `Video.Timestamp`: the transport stream timestamp a video probe stored in
+/// `data` (`FFProbeVideoInfo.cs:247`), if any. The text is read first: a blob
+/// with no `"Timestamp"` key is not parsed.
+#[must_use]
+pub fn stored_timestamp(
+    data: Option<&str>,
+) -> Option<ferrofin_model::media_info::TransportStreamTimestamp> {
+    let text = data.filter(|text| text.contains("\"Timestamp\""))?;
+    serde_json::from_value(parse_data(Some(text)).remove("Timestamp")?).ok()
 }
 
 /// A video's `IHasAspectRatio.AspectRatio` and `ISupportsPlaceHolders.
@@ -1478,6 +1492,7 @@ pub(crate) async fn allow_data_writes(db: &Database) {
 mod tests {
     use super::*;
     use crate::test_support::{seed_item, seed_named_item, test_db};
+    use ferrofin_model::media_info::TransportStreamTimestamp;
 
     /// `PhysicalLocationsList` as the visibility check and the DTO's collection folders have always
     /// read it: anything but an array of strings in an object reads as no locations, and the
@@ -1499,6 +1514,26 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(stored_physical_locations(data), expected);
+    }
+
+    /// `Video.Timestamp` reads by Jellyfin's enum binding (a name, any case, or
+    /// its number); a JSON null, an unknown name, no key and no blob are none.
+    #[rstest::rstest]
+    #[case(
+        Some(r#"{"Timestamp":"Valid"}"#),
+        Some(TransportStreamTimestamp::Valid)
+    )]
+    #[case(Some(r#"{"Timestamp":"none"}"#), Some(TransportStreamTimestamp::None))]
+    #[case(Some(r#"{"Timestamp":1}"#), Some(TransportStreamTimestamp::Zero))]
+    #[case(Some(r#"{"Timestamp":null}"#), None)]
+    #[case(Some(r#"{"Timestamp":"sometimes"}"#), None)]
+    #[case(Some(r#"{"Container":"ts"}"#), None)]
+    #[case(None, None)]
+    fn stored_timestamp_binds_as_jellyfin(
+        #[case] data: Option<&str>,
+        #[case] expected: Option<TransportStreamTimestamp>,
+    ) {
+        assert_eq!(stored_timestamp(data), expected);
     }
 
     /// A library's type reads by Jellyfin's binding and comes back by name: a

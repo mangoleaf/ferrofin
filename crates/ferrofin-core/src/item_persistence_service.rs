@@ -12803,13 +12803,13 @@ mod tests {
     /// `AdditionalParts`/`LocalAlternateVersions` the incoming blob carries
     /// when they differ as ordinal sequences, a stored list absent or `null`
     /// being `[]` (one the incoming blob does not carry stays) — and the
-    /// probe's keys (`PROBE_OWNED_KEYS`, the pre-refresh probe's) the
-    /// incoming blob carries, a `null` being absent, and `LyricFiles` absent
-    /// when it does not carry them; every other key keeps its value and its
-    /// place, though `json_patch` re-renders the document minified. A blob
-    /// that is not a JSON object, video fields in an incoming blob with no
-    /// `VideoType` (no `Video`), or one that already matches leave the stored
-    /// text as it is. `scan_save_changes_row` agrees with the SQL in every
+    /// probe's keys (`PROBE_OWNED_KEYS`, the pre-refresh probe's, a TS video's
+    /// `Timestamp` among them) the incoming blob carries, a `null` being
+    /// absent, and `LyricFiles` absent when it does not carry them; every
+    /// other key keeps its value and its place, though `json_patch`
+    /// re-renders the document minified. A blob that is not a JSON object,
+    /// video fields in an incoming blob with no `VideoType` (no `Video`), or
+    /// one that already matches leave the stored text as it is. `scan_save_changes_row` agrees with the SQL in every
     /// case here (a value that differs only by a JSON escape it does not:
     /// `locked_data_sql`).
     #[rstest::rstest]
@@ -12993,6 +12993,16 @@ mod tests {
         Some(r#"{"VideoType":"Dvd","HasSubtitles":true,"Status":"Ended"}"#),
         Some(r#"{"VideoType":"VideoFile","HasSubtitles":false}"#),
         Some(r#"{"VideoType":"VideoFile","HasSubtitles":false,"Status":"Ended"}"#)
+    )]
+    #[case::timestamp_follows_the_file(
+        Some(r#"{"Timestamp":"Zero","VideoType":"VideoFile"}"#),
+        Some(r#"{"Timestamp":"Valid","VideoType":"VideoFile"}"#),
+        Some(r#"{"Timestamp":"Valid","VideoType":"VideoFile"}"#)
+    )]
+    #[case::unread_timestamp_is_absent(
+        Some(r#"{"Timestamp":"Valid","VideoType":"VideoFile"}"#),
+        Some(r#"{"Timestamp":null,"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#)
     )]
     #[tokio::test]
     async fn a_locked_rows_data_takes_only_the_resolvers_and_the_probes_fields(
