@@ -2240,14 +2240,13 @@ async fn verify_subtitle_destinations(
     let path = media.join("Locale.pt-br.forced.sdh.srt");
     assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
     expected_paths.push(path);
-    // Each upload records its stream and queues a refresh of the item. A refresh
-    // an earlier upload queued can still be running: it listed the folders
-    // before the newest sidecars, reads the stored rows after them, and saves
-    // its older set over them (gl-1408, gl-1527); the refresh queued behind it
-    // (the running scan is never joined) re-lists the folders and saves them
-    // again. A matching set can be the uploads' own rows just before such a
-    // save, so read it only once the library is idle, and keep reading until
-    // it has settled; a stream that never comes back still fails below.
+    // Each upload saves its file and queues a refresh of the item, whose probe
+    // records the stream (gl-1641). A refresh an earlier upload queued can
+    // still be running: it listed the folders before the newest sidecars and
+    // saves a set without them (gl-1408, gl-1527); the refresh queued behind
+    // it (the running scan is never joined) re-lists the folders and saves
+    // them. So read the set only once the library is idle, and keep reading
+    // until it has settled; a stream that never comes back still fails below.
     let deadline = Instant::now() + Duration::from_secs(30);
     let item = loop {
         await_library_idle(api, library).await;

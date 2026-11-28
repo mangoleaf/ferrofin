@@ -112,7 +112,10 @@ impl ScheduledTask for RefreshChannelsTask {
             // Unreachable while Ferrofin registers no channel backends. If one
             // ever appears, this is where the refresh has to be implemented —
             // saying so is more use than a loop that walks the set and calls
-            // nothing.
+            // nothing. That refresh checks the stop token before each channel,
+            // as upstream's `RefreshChannels` does; with none registered today
+            // there is nothing to stop. Upstream's `ChannelPostScanTask`
+            // cleanup is not ported yet (gl-2017).
             tracing::warn!(
                 channels = channels.len(),
                 "channels are registered but Ferrofin has no channel refresh backend"

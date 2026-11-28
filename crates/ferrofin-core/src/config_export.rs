@@ -59,6 +59,7 @@ use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
 use crate::configuration_manager::FerrofinServerConfigurationManager as Manager;
+use crate::named_configuration_files;
 use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
 use crate::virtual_paths::VirtualPathExpander;
 
@@ -142,9 +143,6 @@ struct Document {
 /// missing (Ferrofin has never served the directory) or does not parse, when a
 /// file cannot be read, or when a value cannot be written as XML.
 pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceError> {
-    // `{config}/users/named/`, where `FerrofinServerApplicationPaths` puts the
-    // user configuration directory and the manager the named documents.
-    let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
     let mut export = ConfigExport::default();
     export_document(
         system::FILE,
@@ -156,35 +154,35 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     export_named::<EncodingOptions>(
         encoding::FILE,
         &encoding::DOCUMENT,
-        &named,
+        config_dir,
         Manager::ENCODING_FILE_NAME,
         &mut export,
     )?;
     export_named::<BrandingOptions>(
         branding::FILE,
         &branding::DOCUMENT,
-        &named,
+        config_dir,
         Manager::BRANDING_FILE_NAME,
         &mut export,
     )?;
     export_named::<NetworkConfiguration>(
         network::FILE,
         &network::DOCUMENT,
-        &named,
+        config_dir,
         Manager::NETWORK_FILE_NAME,
         &mut export,
     )?;
     export_named::<MetadataConfiguration>(
         metadata::FILE,
         &metadata::DOCUMENT,
-        &named,
+        config_dir,
         Manager::METADATA_FILE_NAME,
         &mut export,
     )?;
     export_named::<XbmcMetadataOptions>(
         xbmcmetadata::FILE,
         &xbmcmetadata::DOCUMENT,
-        &named,
+        config_dir,
         Manager::XBMC_METADATA_FILE_NAME,
         &mut export,
     )?;
@@ -194,24 +192,17 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
 
 /// The Ferrofin files under the config directory `config_dir` that
 /// [`export_configuration`] and [`export_live_tv`] always write as XML,
-/// whether or not each exists: `system.json` and the named documents. The
+/// whether or not each exists: `system.json` and the named documents, with
+/// the copies of them a release before 1.6.0 left in `users/named/`. The
 /// export leaves them out of its copy (gl-1949): a later adoption by Ferrofin
 /// reads a document's XML only while its JSON is absent.
 #[must_use]
 pub fn exported_sources(config_dir: &Path) -> Vec<PathBuf> {
-    let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
+    let legacy = named_configuration_files::legacy_dir(config_dir);
     let mut files = vec![config_dir.join(Manager::CONFIG_FILE_NAME)];
-    files.extend(
-        [
-            Manager::ENCODING_FILE_NAME,
-            Manager::BRANDING_FILE_NAME,
-            Manager::NETWORK_FILE_NAME,
-            Manager::METADATA_FILE_NAME,
-            Manager::XBMC_METADATA_FILE_NAME,
-            Manager::LIVE_TV_FILE_NAME,
-        ]
-        .map(|name| named.join(name)),
-    );
+    for name in named_configuration_files::FILES {
+        files.extend([config_dir.join(name), legacy.join(name)]);
+    }
     files
 }
 
@@ -335,18 +326,18 @@ pub async fn export_library_options(
     Ok(export)
 }
 
-/// Exports the named document stored as `named/{file}`.
+/// Exports the named document `file` of the config directory `config_dir`.
 fn export_named<T: Serialize + DeserializeOwned + Default>(
     path: &str,
     document: &Document,
-    named: &Path,
+    config_dir: &Path,
     file: &str,
     export: &mut ConfigExport,
 ) -> Result<(), ServiceError> {
     export_document(
         path,
         document,
-        &read_named::<T>(&named.join(file))?,
+        &read_named::<T>(&named_configuration_files::readable(config_dir, file))?,
         &T::default(),
         export,
     )
@@ -558,6 +549,9 @@ mod tests {
             .collect();
         written.sort();
         sources.sort();
+        // Each named document twice: where it is, and where a release before
+        // 1.6.0 kept it.
+        sources.dedup();
         assert_eq!(written, sources);
         assert!(exported_sources(dir.path()).contains(&dir.path().join("system.json")));
     }
@@ -572,10 +566,8 @@ mod tests {
         )
         .expect("write system.json");
         std::fs::write(dir.path().join("system_id"), format!("{SERVER_ID}\n")).expect("write id");
-        let named_dir = dir.path().join("users").join("named");
-        std::fs::create_dir_all(&named_dir).expect("named dir");
         for (file, value) in named {
-            std::fs::write(named_dir.join(file), value.to_string()).expect("write named");
+            std::fs::write(dir.path().join(file), value.to_string()).expect("write named");
         }
         dir
     }
@@ -948,6 +940,26 @@ mod tests {
                 "<UseFileCreationTimeForDateAdded>true</UseFileCreationTimeForDateAdded>"
             )
         );
+    }
+
+    /// A data directory a release before 1.6.0 served, not booted since the
+    /// upgrade, keeps its named documents in `users/named/`: they are the
+    /// ones exported.
+    #[test]
+    fn named_documents_a_release_before_1_6_0_left_are_exported() {
+        let dir = config_dir(
+            &crate::configuration_manager::default_server_configuration(),
+            &[],
+        );
+        let legacy = named_configuration_files::legacy_dir(dir.path());
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        std::fs::write(legacy.join("encoding.json"), r#"{"EncoderPreset":"slow"}"#)
+            .expect("write legacy");
+        let export = export_configuration(dir.path()).expect("exports");
+        assert!(
+            file(&export, "config/encoding.xml").contains("<EncoderPreset>slow</EncoderPreset>")
+        );
+        assert!(exported_sources(dir.path()).contains(&legacy.join("encoding.json")));
     }
 
     /// A directory Ferrofin never served is refused, not exported as

@@ -515,7 +515,8 @@ interface host {
 
     /// Saves a subtitle file for an item. `language` is a three-letter ISO
     /// code, `format` the file extension (`srt`, `ass`); content ≤ 2 MiB
-    /// by default (the operator can raise it).
+    /// by default (the operator can raise it). The item lists the subtitle
+    /// once the refresh the host queues after the save has probed it.
     write-subtitles: func(item-id: string, language: string, format: string, content: list<u8>) -> result<_, string>;
 
     /// Creates a collection OWNED BY THIS PLUGIN, seeded with `item-ids`

@@ -316,9 +316,9 @@ impl NfoSaver {
         let path = PathBuf::from(
             self.configuration
                 .application_paths()
-                .user_configuration_directory_path(),
+                .configuration_directory_path(),
         )
-        .join("named/xbmcmetadata.json");
+        .join("xbmcmetadata.json");
         match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| ServiceError::backend(format!("read NFO options: {error}"))),
