@@ -2,6 +2,8 @@
 
 # Ferrofin
 
+<img src="docs/assets/ferrofin-logo.png" alt="Ferrofin logo" width="200" height="200">
+
 **A drop-in Rust implementation of the Jellyfin media server.**
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
