@@ -652,6 +652,22 @@ pub async fn build_app_state(
             tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
         }
     }
+    // One-shot: earlier builds folded every combining mark out of a name's
+    // `CleanName`/`CleanValue`/`SortName`, and kept the letters outside the
+    // BMP in its clean values; move those keys to upstream's (gl-1908).
+    match item_persistence_impl.repair_diacritic_folds().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "re-derived name keys with Jellyfin's diacritic table"
+            );
+        }
+        Err(err) => {
+            converted = false;
+            tracing::warn!(%err, "diacritic-fold repair failed; names with combining marks or characters outside the BMP may miss by-name lookups until the next boot retries it");
+        }
+    }
     // One-shot: box sets and playlists an older build created had no dates,
     // and a renamed playlist kept its old name's `CleanName`/`SortName`, so a
     // search for its new name missed it.

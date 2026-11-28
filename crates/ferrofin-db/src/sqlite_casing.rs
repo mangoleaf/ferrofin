@@ -121,12 +121,15 @@ unsafe extern "C" fn register_on_connection(
         map: upper_invariant,
         ascii: Some(u8::to_ascii_uppercase),
     };
+    // The current derivation: Live TV's programme filters compare it with
+    // `get_clean_value` binds at run time. The previous one stays on the
+    // diacritic fold of its time (gl-1908).
     static CLEAN: TextFunction = TextFunction::whole(get_clean_value);
     static PREVIOUS_CLEAN: TextFunction = TextFunction::whole(|value| {
         if value.trim().is_empty() {
             value.to_owned()
         } else {
-            ferrofin_util::string_extensions::remove_diacritics(value).to_lowercase()
+            ferrofin_util::string_extensions::remove_diacritics_nfd(value).to_lowercase()
         }
     });
     for (name, function) in [
@@ -182,6 +185,7 @@ mod tests {
     #[case("ıİiI")]
     #[case("ᾀᾈ𐐨𐐀")]
     #[case("Straße")]
+    #[case("Zoe\u{308} Saldan\u{303}a Đorđe")]
     #[case("A\0É")]
     #[case("")]
     #[case("plain ascii title 123")]
@@ -213,6 +217,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(null, None);
+    }
+
+    /// `ferrofin_clean_value` is the current derivation, which Live TV's
+    /// queries compare with Rust binds; `ferrofin_previous_clean_value`, which
+    /// migration `0031` recognises old keys by, keeps the fold before gl-1908
+    /// (combining marks dropped, `ß` split).
+    #[tokio::test]
+    async fn clean_value_functions_are_the_current_and_the_previous_derivation() {
+        let db = crate::Database::connect_in_memory().await.unwrap();
+        let result: (String, String) =
+            sqlx::query_as("SELECT ferrofin_clean_value(?1), ferrofin_previous_clean_value(?1)")
+                .bind("Zoe\u{308} Saldan\u{303}a: Stra\u{df}e")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            result,
+            (
+                "zoe saldan a stra\u{df}e".to_owned(),
+                "zoe saldana: strasse".to_owned()
+            )
+        );
     }
 
     /// .NET's invariant casing, spelled out: a function's ASCII path and its

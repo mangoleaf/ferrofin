@@ -66,8 +66,8 @@ pub fn by_name_presentation_key(stored_type: &str, name: &str) -> Option<String>
 ///
 /// Runs once per boot, right after the migration chain. It is the by-name half
 /// of the repair migration `0028_presentation_key_backfill_all` performs for
-/// every other kind: SQLite cannot express `RemoveDiacritics` (it is a Unicode
-/// NFD fold plus a ligature map, `ferrofin_util::string_extensions`), so the
+/// every other kind: SQLite cannot express `RemoveDiacritics` (the
+/// `Diacritics` package's character table, `ferrofin_util::string_extensions`), so the
 /// five kinds whose key is derived from their NAME are repaired here, where the
 /// real function is in reach, instead of being guessed in SQL. It is the only
 /// boot pass that keys these rows; the later boot repairs (the person repair
@@ -150,7 +150,7 @@ mod tests {
 
     /// The five overriding kinds, spelled the way the oracle's own database
     /// spells them. `Béla Tarr` is the case migration 0027's SQL could never
-    /// have produced and the reason this half is Rust: SQLite has no NFD fold.
+    /// have produced and the reason this half is Rust: SQLite has no diacritic fold.
     #[test]
     fn by_name_key_matches_the_oracle_spelling() {
         for (stored_type, name, expected) in [

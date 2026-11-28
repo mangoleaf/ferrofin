@@ -1,11 +1,9 @@
 //! Port of `StringExtensions.cs` — string helpers for counting, splitting on a
 //! needle, diacritic removal/detection, transliteration and normalization.
 //!
-//! C# used ICU4N + the `Diacritics.Extensions` library. Here diacritic removal
-//! is done via Unicode NFD decomposition + stripping of combining marks, plus a
-//! small explicit map for non-decomposable ligatures (e.g. `œ` → `oe`). This
-//! matches the ported test oracle exactly. Transliteration runs ICU4X's CLDR
-//! transforms (see [`transliterated`]).
+//! C# used ICU4N + the `Diacritics` package. Diacritic removal is that
+//! package's character table ([`remove_diacritics`]); transliteration runs
+//! ICU4X's CLDR transforms (see [`transliterated`]).
 //!
 //! [`zero_padded`] is not from that file: it is .NET's zero-placeholder custom
 //! format of an integer (`ToString("000")`).
@@ -17,8 +15,15 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 /// C# `@"[^\p{L}\p{N}\s]"` in `GetCleanValue` — anything that is not a Unicode
-/// letter, number or whitespace.
+/// letter, number or whitespace. .NET matches it against UTF-16 units, so a
+/// character outside the Basic Multilingual Plane, two surrogates of category
+/// `Cs`, never counts as a letter or a number.
 static NOT_LETTER_DIGIT_SPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]|[\x{10000}-\x{10FFFF}]").expect("valid regex"));
+
+/// [`NOT_LETTER_DIGIT_SPACE`] as builds before gl-1908 matched it, by code
+/// point, for [`get_clean_value_nfd`].
+static NOT_LETTER_DIGIT_SPACE_BY_CODE_POINT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]").expect("valid regex"));
 
 /// C# `@"\s+"` in `GetCleanValue` — a run of whitespace to collapse.
@@ -34,8 +39,8 @@ pub const TRANSLITERATOR_ID_ENV: &str = "JELLYFIN_TRANSLITERATOR_ID";
 pub const DEFAULT_TRANSLITERATOR_ID: &str =
     "Any-Latin; Latin-Ascii; Lower; NFD; [:Nonspacing Mark:] Remove; [:Punctuation:] Remove;";
 
-/// Non-decomposable ligatures / letters that NFD does not split into ASCII, but
-/// which the diacritic oracle expects to be folded.
+/// The ligatures and letters NFD does not split that [`remove_diacritics_nfd`]
+/// folds.
 fn ligature_map() -> &'static HashMap<char, &'static str> {
     static MAP: OnceLock<HashMap<char, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -48,14 +53,6 @@ fn ligature_map() -> &'static HashMap<char, &'static str> {
         m.insert('Ø', "O");
         m.insert('ł', "l");
         m.insert('Ł', "L");
-        // NOT `ð`/`þ`: Jellyfin's `Diacritics.Extensions` leaves them alone, and
-        // a real 10.11.8 library proves it — it stores `Person-Gisli Orn
-        // Garðarsson` and `Person-Þorsteinn Bachmann`, folding every *other*
-        // accent in the same name. Folding them here made those people
-        // unfindable by name on an adopted database, which is the exact bug
-        // this column exists to avoid. (`ø`, `æ`, `œ` and `ł` ARE folded there
-        // — same library, same rows. `ß` is unverified either way: no name in
-        // the library carries one and upstream's own test suite has no case.)
         m.insert('ß', "ss");
         m
     })
@@ -76,28 +73,354 @@ fn contains_non_conforming_unicode(text: &str) -> bool {
 
 /// Removes the diacritics characters from the string.
 ///
-/// Non-conforming Unicode (`U+FFFD`) is stripped first, then the string is
-/// NFD-decomposed, combining marks are removed, and remaining non-decomposable
-/// ligatures are folded.
+/// Port of upstream's `RemoveDiacritics`
+/// (`src/Jellyfin.Extensions/StringExtensions.cs:42-44`): non-conforming
+/// Unicode (`U+FFFD`) is stripped, then every character the `Diacritics`
+/// package maps is replaced by its base ([`diacritic_base`]). The package
+/// looks each UTF-16 unit up in a table and normalises nothing, so a
+/// combining mark stays where it is (`Saldan\u{303}a` is unchanged; only
+/// U+0327, the combining cedilla, is in the table), and so do the precomposed
+/// letters the table lacks (`ĉ`, pinyin `ǒ`, Greek polytonic, Hebrew
+/// presentation forms).
 #[must_use]
 pub fn remove_diacritics(text: &str) -> String {
-    // Every step of the fold is identity on ASCII: only U+FFFD is stripped,
-    // NFD/NFC leave ASCII alone, and no nonspacing mark or ligature key is ASCII.
+    // No key of the table is ASCII, and neither is U+FFFD.
     if text.is_ascii() {
         return text.to_owned();
     }
-    fold_diacritics(text)
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars().filter(|&c| c != '\u{FFFD}') {
+        match diacritic_base(c) {
+            Some(base) => out.push_str(base),
+            None => out.push(c),
+        }
+    }
+    out
 }
 
-/// The full diacritic fold behind [`remove_diacritics`], without its ASCII
-/// fast path.
-fn fold_diacritics(text: &str) -> String {
+/// The base the `Diacritics` package replaces `c` with, or `None` when `c` is
+/// not in its table ([`DIACRITICS`]).
+fn diacritic_base(c: char) -> Option<&'static str> {
+    DIACRITICS
+        .binary_search_by_key(&c, |&(key, _)| key)
+        .ok()
+        .map(|at| DIACRITICS[at].1)
+}
+
+/// The table of `Diacritics` 4.1.8 as Jellyfin 12.4 ships it, read from the
+/// package's own `DiacriticsMapper` (gl-1908), in code point order: the
+/// package's 283 entries but `ß`, which maps to itself, each mapped to its
+/// `MappingReplacement.Base` (the `Decompose` forms are opt-in, and Jellyfin
+/// does not ask for them). The four with no base (`¡`, `¿`, U+0327 and `⸘`)
+/// are removed. No key lies outside the Basic Multilingual Plane, so walking
+/// `char`s finds what the package finds walking UTF-16 units.
+static DIACRITICS: [(char, &str); 282] = [
+    ('\u{00A1}', ""),         // ¡
+    ('\u{00AA}', "a"),        // ª
+    ('\u{00BA}', "o"),        // º
+    ('\u{00BF}', ""),         // ¿
+    ('\u{00C0}', "A"),        // À
+    ('\u{00C1}', "A"),        // Á
+    ('\u{00C2}', "A"),        // Â
+    ('\u{00C3}', "A"),        // Ã
+    ('\u{00C4}', "A"),        // Ä
+    ('\u{00C5}', "A"),        // Å
+    ('\u{00C7}', "C"),        // Ç
+    ('\u{00C8}', "E"),        // È
+    ('\u{00C9}', "E"),        // É
+    ('\u{00CA}', "E"),        // Ê
+    ('\u{00CB}', "E"),        // Ë
+    ('\u{00CC}', "I"),        // Ì
+    ('\u{00CD}', "I"),        // Í
+    ('\u{00CE}', "I"),        // Î
+    ('\u{00CF}', "I"),        // Ï
+    ('\u{00D1}', "N"),        // Ñ
+    ('\u{00D2}', "O"),        // Ò
+    ('\u{00D3}', "O"),        // Ó
+    ('\u{00D4}', "O"),        // Ô
+    ('\u{00D5}', "O"),        // Õ
+    ('\u{00D6}', "O"),        // Ö
+    ('\u{00D8}', "O"),        // Ø
+    ('\u{00D9}', "U"),        // Ù
+    ('\u{00DA}', "U"),        // Ú
+    ('\u{00DB}', "U"),        // Û
+    ('\u{00DC}', "U"),        // Ü
+    ('\u{00DD}', "Y"),        // Ý
+    ('\u{00E0}', "a"),        // à
+    ('\u{00E1}', "a"),        // á
+    ('\u{00E2}', "a"),        // â
+    ('\u{00E3}', "a"),        // ã
+    ('\u{00E4}', "a"),        // ä
+    ('\u{00E5}', "a"),        // å
+    ('\u{00E6}', "ae"),       // æ
+    ('\u{00E7}', "c"),        // ç
+    ('\u{00E8}', "e"),        // è
+    ('\u{00E9}', "e"),        // é
+    ('\u{00EA}', "e"),        // ê
+    ('\u{00EB}', "e"),        // ë
+    ('\u{00EC}', "i"),        // ì
+    ('\u{00ED}', "i"),        // í
+    ('\u{00EE}', "i"),        // î
+    ('\u{00EF}', "i"),        // ï
+    ('\u{00F1}', "n"),        // ñ
+    ('\u{00F2}', "o"),        // ò
+    ('\u{00F3}', "o"),        // ó
+    ('\u{00F4}', "o"),        // ô
+    ('\u{00F5}', "o"),        // õ
+    ('\u{00F6}', "o"),        // ö
+    ('\u{00F8}', "o"),        // ø
+    ('\u{00F9}', "u"),        // ù
+    ('\u{00FA}', "u"),        // ú
+    ('\u{00FB}', "u"),        // û
+    ('\u{00FC}', "u"),        // ü
+    ('\u{00FD}', "y"),        // ý
+    ('\u{00FF}', "y"),        // ÿ
+    ('\u{0100}', "A"),        // Ā
+    ('\u{0101}', "a"),        // ā
+    ('\u{0102}', "A"),        // Ă
+    ('\u{0103}', "a"),        // ă
+    ('\u{0104}', "A"),        // Ą
+    ('\u{0105}', "a"),        // ą
+    ('\u{0106}', "C"),        // Ć
+    ('\u{0107}', "c"),        // ć
+    ('\u{010C}', "C"),        // Č
+    ('\u{010D}', "c"),        // č
+    ('\u{010E}', "D"),        // Ď
+    ('\u{010F}', "d"),        // ď
+    ('\u{0110}', "D"),        // Đ
+    ('\u{0111}', "d"),        // đ
+    ('\u{0112}', "E"),        // Ē
+    ('\u{0113}', "e"),        // ē
+    ('\u{0116}', "E"),        // Ė
+    ('\u{0117}', "e"),        // ė
+    ('\u{0118}', "E"),        // Ę
+    ('\u{0119}', "e"),        // ę
+    ('\u{011A}', "E"),        // Ě
+    ('\u{011B}', "e"),        // ě
+    ('\u{011E}', "G"),        // Ğ
+    ('\u{011F}', "g"),        // ğ
+    ('\u{0122}', "G"),        // Ģ
+    ('\u{0123}', "g"),        // ģ
+    ('\u{0128}', "I"),        // Ĩ
+    ('\u{0129}', "i"),        // ĩ
+    ('\u{012A}', "I"),        // Ī
+    ('\u{012B}', "i"),        // ī
+    ('\u{012E}', "I"),        // Į
+    ('\u{012F}', "i"),        // į
+    ('\u{0130}', "I"),        // İ
+    ('\u{0131}', "i"),        // ı
+    ('\u{0136}', "K"),        // Ķ
+    ('\u{0137}', "k"),        // ķ
+    ('\u{0139}', "L"),        // Ĺ
+    ('\u{013A}', "l"),        // ĺ
+    ('\u{013B}', "L"),        // Ļ
+    ('\u{013C}', "l"),        // ļ
+    ('\u{013D}', "L"),        // Ľ
+    ('\u{013E}', "l"),        // ľ
+    ('\u{0141}', "L"),        // Ł
+    ('\u{0142}', "l"),        // ł
+    ('\u{0143}', "N"),        // Ń
+    ('\u{0144}', "n"),        // ń
+    ('\u{0145}', "N"),        // Ņ
+    ('\u{0146}', "n"),        // ņ
+    ('\u{0147}', "N"),        // Ň
+    ('\u{0148}', "n"),        // ň
+    ('\u{014C}', "O"),        // Ō
+    ('\u{014D}', "o"),        // ō
+    ('\u{0150}', "O"),        // Ő
+    ('\u{0151}', "o"),        // ő
+    ('\u{0153}', "oe"),       // œ
+    ('\u{0154}', "R"),        // Ŕ
+    ('\u{0155}', "r"),        // ŕ
+    ('\u{0158}', "R"),        // Ř
+    ('\u{0159}', "r"),        // ř
+    ('\u{015A}', "S"),        // Ś
+    ('\u{015B}', "s"),        // ś
+    ('\u{015E}', "S"),        // Ş
+    ('\u{015F}', "s"),        // ş
+    ('\u{0160}', "S"),        // Š
+    ('\u{0161}', "s"),        // š
+    ('\u{0164}', "T"),        // Ť
+    ('\u{0165}', "t"),        // ť
+    ('\u{0168}', "U"),        // Ũ
+    ('\u{0169}', "u"),        // ũ
+    ('\u{016A}', "U"),        // Ū
+    ('\u{016B}', "u"),        // ū
+    ('\u{016E}', "U"),        // Ů
+    ('\u{016F}', "u"),        // ů
+    ('\u{0170}', "U"),        // Ű
+    ('\u{0171}', "u"),        // ű
+    ('\u{0178}', "Y"),        // Ÿ
+    ('\u{0179}', "Z"),        // Ź
+    ('\u{017A}', "z"),        // ź
+    ('\u{017B}', "Z"),        // Ż
+    ('\u{017C}', "z"),        // ż
+    ('\u{017D}', "Z"),        // Ž
+    ('\u{017E}', "z"),        // ž
+    ('\u{018F}', "A"),        // Ə
+    ('\u{01A0}', "O"),        // Ơ
+    ('\u{01A1}', "o"),        // ơ
+    ('\u{01AF}', "U"),        // Ư
+    ('\u{01B0}', "u"),        // ư
+    ('\u{0218}', "S"),        // Ș
+    ('\u{0219}', "s"),        // ș
+    ('\u{021A}', "T"),        // Ț
+    ('\u{021B}', "t"),        // ț
+    ('\u{0259}', "a"),        // ə
+    ('\u{0327}', ""),         // combining cedilla
+    ('\u{0386}', "\u{0391}"), // Ά -> Α
+    ('\u{0388}', "\u{0395}"), // Έ -> Ε
+    ('\u{0389}', "\u{0397}"), // Ή -> Η
+    ('\u{038A}', "\u{0399}"), // Ί -> Ι
+    ('\u{038C}', "\u{039F}"), // Ό -> Ο
+    ('\u{038E}', "\u{03A5}"), // Ύ -> Υ
+    ('\u{038F}', "\u{03A9}"), // Ώ -> Ω
+    ('\u{0390}', "\u{03B9}"), // ΐ -> ι
+    ('\u{03AA}', "\u{0399}"), // Ϊ -> Ι
+    ('\u{03AB}', "\u{03A5}"), // Ϋ -> Υ
+    ('\u{03AC}', "\u{03B1}"), // ά -> α
+    ('\u{03AD}', "\u{03B5}"), // έ -> ε
+    ('\u{03AE}', "\u{03B7}"), // ή -> η
+    ('\u{03AF}', "\u{03B9}"), // ί -> ι
+    ('\u{03B0}', "\u{03C5}"), // ΰ -> υ
+    ('\u{03CA}', "\u{03B9}"), // ϊ -> ι
+    ('\u{03CB}', "\u{03C5}"), // ϋ -> υ
+    ('\u{03CC}', "\u{03BF}"), // ό -> ο
+    ('\u{03CD}', "\u{03C5}"), // ύ -> υ
+    ('\u{03CE}', "\u{03C9}"), // ώ -> ω
+    ('\u{0401}', "\u{0415}"), // Ё -> Е
+    ('\u{0407}', "\u{0406}"), // Ї -> І
+    ('\u{040E}', "\u{0423}"), // Ў -> У
+    ('\u{0419}', "\u{0418}"), // Й -> И
+    ('\u{0439}', "\u{0438}"), // й -> и
+    ('\u{0451}', "\u{0435}"), // ё -> е
+    ('\u{0457}', "\u{0456}"), // ї -> і
+    ('\u{045E}', "\u{0443}"), // ў -> у
+    ('\u{0622}', "\u{0627}"), // آ -> ا
+    ('\u{0623}', "\u{0627}"), // أ -> ا
+    ('\u{0624}', "\u{0648}"), // ؤ -> و
+    ('\u{0625}', "\u{0627}"), // إ -> ا
+    ('\u{0626}', "\u{064A}"), // ئ -> ي
+    ('\u{0649}', "\u{064A}"), // ى -> ي
+    ('\u{0671}', "\u{0627}"), // ٱ -> ا
+    ('\u{06C2}', "\u{06C1}"), // ۂ -> ہ
+    ('\u{0B94}', "\u{0B92}"), // ஔ -> ஒ
+    ('\u{1E9E}', "\u{00DF}"), // ẞ -> ß
+    ('\u{1EA0}', "A"),        // Ạ
+    ('\u{1EA1}', "a"),        // ạ
+    ('\u{1EA2}', "A"),        // Ả
+    ('\u{1EA3}', "a"),        // ả
+    ('\u{1EA4}', "A"),        // Ấ
+    ('\u{1EA5}', "a"),        // ấ
+    ('\u{1EA6}', "A"),        // Ầ
+    ('\u{1EA7}', "a"),        // ầ
+    ('\u{1EA8}', "A"),        // Ẩ
+    ('\u{1EA9}', "a"),        // ẩ
+    ('\u{1EAA}', "A"),        // Ẫ
+    ('\u{1EAB}', "a"),        // ẫ
+    ('\u{1EAC}', "A"),        // Ậ
+    ('\u{1EAD}', "a"),        // ậ
+    ('\u{1EAE}', "A"),        // Ắ
+    ('\u{1EAF}', "a"),        // ắ
+    ('\u{1EB0}', "A"),        // Ằ
+    ('\u{1EB1}', "a"),        // ằ
+    ('\u{1EB2}', "A"),        // Ẳ
+    ('\u{1EB3}', "a"),        // ẳ
+    ('\u{1EB4}', "A"),        // Ẵ
+    ('\u{1EB5}', "a"),        // ẵ
+    ('\u{1EB6}', "A"),        // Ặ
+    ('\u{1EB7}', "a"),        // ặ
+    ('\u{1EB8}', "E"),        // Ẹ
+    ('\u{1EB9}', "e"),        // ẹ
+    ('\u{1EBA}', "E"),        // Ẻ
+    ('\u{1EBB}', "e"),        // ẻ
+    ('\u{1EBC}', "E"),        // Ẽ
+    ('\u{1EBD}', "e"),        // ẽ
+    ('\u{1EBE}', "E"),        // Ế
+    ('\u{1EBF}', "e"),        // ế
+    ('\u{1EC0}', "E"),        // Ề
+    ('\u{1EC1}', "e"),        // ề
+    ('\u{1EC2}', "E"),        // Ể
+    ('\u{1EC3}', "e"),        // ể
+    ('\u{1EC4}', "E"),        // Ễ
+    ('\u{1EC5}', "e"),        // ễ
+    ('\u{1EC6}', "E"),        // Ệ
+    ('\u{1EC7}', "e"),        // ệ
+    ('\u{1EC8}', "I"),        // Ỉ
+    ('\u{1EC9}', "i"),        // ỉ
+    ('\u{1ECA}', "I"),        // Ị
+    ('\u{1ECB}', "i"),        // ị
+    ('\u{1ECC}', "O"),        // Ọ
+    ('\u{1ECD}', "o"),        // ọ
+    ('\u{1ECE}', "O"),        // Ỏ
+    ('\u{1ECF}', "o"),        // ỏ
+    ('\u{1ED0}', "O"),        // Ố
+    ('\u{1ED1}', "o"),        // ố
+    ('\u{1ED2}', "O"),        // Ồ
+    ('\u{1ED3}', "o"),        // ồ
+    ('\u{1ED4}', "O"),        // Ổ
+    ('\u{1ED5}', "o"),        // ổ
+    ('\u{1ED6}', "O"),        // Ỗ
+    ('\u{1ED7}', "o"),        // ỗ
+    ('\u{1ED8}', "O"),        // Ộ
+    ('\u{1ED9}', "o"),        // ộ
+    ('\u{1EDA}', "O"),        // Ớ
+    ('\u{1EDB}', "o"),        // ớ
+    ('\u{1EDC}', "O"),        // Ờ
+    ('\u{1EDD}', "o"),        // ờ
+    ('\u{1EDE}', "O"),        // Ở
+    ('\u{1EDF}', "o"),        // ở
+    ('\u{1EE0}', "O"),        // Ỡ
+    ('\u{1EE1}', "o"),        // ỡ
+    ('\u{1EE2}', "O"),        // Ợ
+    ('\u{1EE3}', "o"),        // ợ
+    ('\u{1EE4}', "U"),        // Ụ
+    ('\u{1EE5}', "u"),        // ụ
+    ('\u{1EE6}', "U"),        // Ủ
+    ('\u{1EE7}', "u"),        // ủ
+    ('\u{1EE8}', "U"),        // Ứ
+    ('\u{1EE9}', "u"),        // ứ
+    ('\u{1EEA}', "U"),        // Ừ
+    ('\u{1EEB}', "u"),        // ừ
+    ('\u{1EEC}', "U"),        // Ử
+    ('\u{1EED}', "u"),        // ử
+    ('\u{1EEE}', "U"),        // Ữ
+    ('\u{1EEF}', "u"),        // ữ
+    ('\u{1EF0}', "U"),        // Ự
+    ('\u{1EF1}', "u"),        // ự
+    ('\u{1EF2}', "Y"),        // Ỳ
+    ('\u{1EF3}', "y"),        // ỳ
+    ('\u{1EF4}', "Y"),        // Ỵ
+    ('\u{1EF5}', "y"),        // ỵ
+    ('\u{1EF6}', "Y"),        // Ỷ
+    ('\u{1EF7}', "y"),        // ỷ
+    ('\u{1EF8}', "Y"),        // Ỹ
+    ('\u{1EF9}', "y"),        // ỹ
+    ('\u{2E18}', ""),         // ⸘
+];
+
+/// Checks whether the specified string has diacritics in it.
+#[must_use]
+pub fn has_diacritics(text: &str) -> bool {
+    remove_diacritics(text) != *text || contains_non_conforming_unicode(text)
+}
+
+/// The diacritic fold builds before gl-1908 used: NFD-decompose, drop the
+/// nonspacing marks of [`is_nonspacing_mark`], fold [`ligature_map`], and
+/// recompose (NFC).
+///
+/// Frozen: the SQLite functions released migration `0031` calls and the
+/// one-shot repairs that recognise the keys it gave use it. Never use it for a
+/// new write or a query parameter; that is [`remove_diacritics`].
+#[must_use]
+pub fn remove_diacritics_nfd(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_owned();
+    }
     let cleaned = strip_non_conforming_unicode(text);
     let map = ligature_map();
     let mut decomposed = String::with_capacity(cleaned.len());
     for ch in cleaned.nfd() {
-        // NFD combining marks are the Unicode "Mark, Nonspacing" (Mn) class;
-        // in the Basic range they live in U+0300..=U+036F (and other blocks).
         if is_nonspacing_mark(ch) {
             continue;
         }
@@ -107,21 +430,10 @@ fn fold_diacritics(text: &str) -> String {
             decomposed.push(ch);
         }
     }
-
-    // Re-compose (NFC) so precomposed code points that carry no diacritics
-    // (e.g. Hangul syllables, which NFD splits into jamo) are restored to their
-    // original single-code-point form. Anything whose combining mark was removed
-    // stays base-only, since the mark is gone before recomposition.
     decomposed.nfc().collect()
 }
 
-/// Checks whether the specified string has diacritics in it.
-#[must_use]
-pub fn has_diacritics(text: &str) -> bool {
-    remove_diacritics(text) != *text || contains_non_conforming_unicode(text)
-}
-
-/// Returns whether a code point is a Unicode nonspacing combining mark.
+/// The nonspacing marks [`remove_diacritics_nfd`] drops.
 fn is_nonspacing_mark(c: char) -> bool {
     matches!(c as u32,
         0x0300..=0x036F | // Combining Diacritical Marks
@@ -265,16 +577,37 @@ pub fn truncate_at_null(text: &str) -> &str {
 /// The character classes are the regex ones on purpose: `\p{L}` is the Unicode
 /// *Letter* category, which excludes combining marks (`Mn`/`Mc`) that
 /// [`char::is_alphabetic`] would keep — a Devanagari vowel sign is replaced by
-/// a space here exactly as .NET does it.
+/// a space here exactly as .NET does it, and so is a combining mark the
+/// diacritic fold keeps (`Saldan\u{303}a` stores as `saldan a`). A character
+/// outside the Basic Multilingual Plane is a space too, letter or not: .NET's
+/// regex sees its two surrogates (`𠀀大` stores as `大`).
 ///
 /// Returns the original string unchanged if it is empty or all whitespace.
 #[must_use]
 pub fn get_clean_value(value: &str) -> String {
+    clean_value_with(value, remove_diacritics, &NOT_LETTER_DIGIT_SPACE)
+}
+
+/// [`get_clean_value`] as builds before gl-1908 derived it: over
+/// [`remove_diacritics_nfd`], with a character outside the Basic Multilingual
+/// Plane kept when it is a letter or a number. Kept only so the one-shot repair
+/// can recognise the clean values they stored. Never use it for a new write or
+/// a query parameter.
+#[must_use]
+pub fn get_clean_value_nfd(value: &str) -> String {
+    clean_value_with(
+        value,
+        remove_diacritics_nfd,
+        &NOT_LETTER_DIGIT_SPACE_BY_CODE_POINT,
+    )
+}
+
+fn clean_value_with(value: &str, fold: fn(&str) -> String, not_word: &Regex) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-    let cleaned = lower_invariant(&remove_diacritics(value));
-    let cleaned = NOT_LETTER_DIGIT_SPACE.replace_all(&cleaned, " ");
+    let cleaned = lower_invariant(&fold(value));
+    let cleaned = not_word.replace_all(&cleaned, " ");
     WHITESPACE_RUN.replace_all(&cleaned, " ").trim().to_owned()
 }
 
@@ -581,22 +914,21 @@ mod tests {
         assert_eq!(expected, result);
     }
 
-    /// The ASCII fast path returns exactly what the full fold would: the fold
-    /// leaves every ASCII char alone, all of them together, and the ASCII on
-    /// both sides of a non-ASCII run (which takes the full fold).
+    /// The ASCII fast path returns what the table would: no key is ASCII, so
+    /// every ASCII char, all of them together, and the ASCII on both sides of a
+    /// mapped char come through unchanged. The same holds for the frozen fold.
     #[test]
-    fn remove_diacritics_ascii_fast_path_matches_full_fold() {
+    fn remove_diacritics_ascii_fast_path_matches_the_table() {
         let all_ascii: String = (0u8..=127).map(char::from).collect();
-        for input in all_ascii
-            .chars()
-            .map(String::from)
-            .chain([all_ascii.clone()])
-        {
-            assert_eq!(fold_diacritics(&input), input, "{input:?}");
-            assert_eq!(remove_diacritics(&input), input, "{input:?}");
-        }
-        for mixed in ["é", "e\u{301}", "\u{301}", "œ", "Ø", "ß", "\u{FFFD}", "운"] {
-            let folded = fold_diacritics(mixed);
+        assert!(all_ascii.chars().all(|c| diacritic_base(c).is_none()));
+        assert_eq!(remove_diacritics(&all_ascii), all_ascii);
+        assert_eq!(remove_diacritics_nfd(&all_ascii), all_ascii);
+        for (mixed, folded) in [
+            ("é", "e"),
+            ("e\u{301}", "e\u{301}"),
+            ("\u{FFFD}", ""),
+            ("운", "운"),
+        ] {
             let input = format!("{all_ascii}{mixed}{all_ascii}");
             assert_eq!(
                 remove_diacritics(&input),
@@ -604,6 +936,114 @@ mod tests {
                 "{mixed:?}"
             );
         }
+    }
+
+    /// The table changes exactly the 282 characters the package's
+    /// `RemoveDiacritics` changes when run alone over every BMP code unit
+    /// (gl-1908), and each of them to one short base.
+    #[test]
+    fn the_table_maps_what_the_diacritics_package_maps() {
+        let mapped: Vec<char> = (0..=0xFFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| diacritic_base(c).is_some())
+            .collect();
+        assert_eq!(mapped.len(), 282);
+        assert!(
+            DIACRITICS.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "the binary search needs the keys in order"
+        );
+        assert!(
+            mapped
+                .iter()
+                .all(|&c| remove_diacritics(&c.to_string()) != c.to_string())
+        );
+        assert_eq!(diacritic_base('ß'), None, "the package maps ß to itself");
+    }
+
+    /// Jellyfin 12.4's own `RemoveDiacritics` and `GetCleanValue`, run from
+    /// the assemblies its image ships (gl-1908): combining marks are kept
+    /// (only the combining cedilla goes), letters outside the package's table
+    /// are kept, and a kept mark becomes a space in the clean value.
+    #[rstest]
+    #[case("Zoë Saldaña", "Zoe Saldana", "zoe saldana")]
+    #[case(
+        "Zoe\u{308} Saldan\u{303}a",
+        "Zoe\u{308} Saldan\u{303}a",
+        "zoe saldan a"
+    )]
+    #[case("Zoë Saldan\u{303}a", "Zoe Saldan\u{303}a", "zoe saldan a")]
+    #[case(
+        "\u{5E9}\u{5B8}\u{5C1}\u{5DC}\u{5D5}\u{5B9}\u{5DD}",
+        "\u{5E9}\u{5B8}\u{5C1}\u{5DC}\u{5D5}\u{5B9}\u{5DD}",
+        "ש לו ם"
+    )]
+    #[case(
+        "\u{645}\u{64F}\u{62D}\u{64E}\u{645}\u{651}\u{64E}\u{62F}",
+        "\u{645}\u{64F}\u{62D}\u{64E}\u{645}\u{651}\u{64E}\u{62F}",
+        "م ح م د"
+    )]
+    #[case("בראשית", "בראשית", "בראשית")]
+    #[case("Straße", "Straße", "straße")]
+    #[case("STRA\u{1E9E}E", "STRAßE", "straße")]
+    #[case("¡Three Amigos!", "Three Amigos!", "three amigos")]
+    #[case("¿Quién?", "Quien?", "quien")]
+    #[case("Esperanto Ĉeĥo", "Esperanto Ĉeĥo", "esperanto ĉeĥo")]
+    #[case("Wǒ Ài Nǐ", "Wǒ Ai Nǐ", "wǒ ai nǐ")]
+    #[case("Țară", "Tara", "tara")]
+    #[case("Ţară", "Ţara", "ţara")]
+    #[case("Muškatų", "Muskatų", "muskatų")]
+    #[case("Fran\u{63}\u{327}ois", "Francois", "francois")]
+    #[case("Αθήνα", "Αθηνα", "αθηνα")]
+    #[case("Ἀθῆναι", "Ἀθῆναι", "ἀθῆναι")]
+    #[case("Андрей", "Андреи", "андреи")]
+    #[case("Ёлка", "Елка", "елка")]
+    #[case("ѓуб", "ѓуб", "ѓуб")]
+    #[case("Mañana ª º", "Manana a o", "manana a o")]
+    #[case("İstanbul ı", "Istanbul i", "istanbul i")]
+    #[case("Əli ə", "Ali a", "ali a")]
+    #[case("Đorđe", "Dorde", "dorde")]
+    #[case("Æon Fløde Œuvre Łódź", "Æon Flode Œuvre Lodz", "æon flode œuvre lodz")]
+    #[case("Ðð Þþ", "Ðð Þþ", "ðð þþ")]
+    #[case("الموسيقى", "الموسيقي", "الموسيقي")]
+    #[case("ٱلله", "الله", "الله")]
+    #[case("ஔவை", "ஒவை", "ஒவ")]
+    #[case("\u{212B}\u{2126}\u{212A}", "\u{212B}\u{2126}\u{212A}", "åωk")]
+    #[case("\u{F900}", "\u{F900}", "\u{F900}")]
+    #[case("Tiếng Việt", "Tieng Viet", "tieng viet")]
+    #[case("\u{FB2A}לום", "\u{FB2A}לום", "\u{FB2A}לום")]
+    #[case("किताब", "किताब", "क त ब")]
+    #[case("é\u{301}", "e\u{301}", "e")]
+    // Outside the Basic Multilingual Plane every character is two surrogates
+    // to .NET's regex, so letters and numbers there clean to spaces too.
+    #[case("\u{10400} Zoë", "\u{10400} Zoe", "zoe")]
+    #[case("\u{20000}大", "\u{20000}大", "大")]
+    #[case("\u{1D400}bc", "\u{1D400}bc", "bc")]
+    #[case("a\u{1F600}b", "a\u{1F600}b", "a b")]
+    #[case("x\u{1D7CE}2", "x\u{1D7CE}2", "x 2")]
+    fn diacritics_match_jellyfin_12_4(
+        #[case] input: &str,
+        #[case] removed: &str,
+        #[case] clean: &str,
+    ) {
+        assert_eq!(remove_diacritics(input), removed, "{input}");
+        assert_eq!(get_clean_value(input), clean, "{input}");
+    }
+
+    /// The frozen fold keeps giving what builds before gl-1908 stored.
+    #[rstest]
+    #[case("Zoe\u{308} Saldan\u{303}a", "Zoe Saldana", "zoe saldana")]
+    #[case("Straße", "Strasse", "strasse")]
+    #[case("Æon Œuvre", "AEon OEuvre", "aeon oeuvre")]
+    #[case("\u{5E9}\u{5B8}\u{5C1}\u{5DC}\u{5D5}\u{5B9}\u{5DD}", "שלום", "שלום")]
+    #[case("Esperanto Ĉeĥo", "Esperanto Ceho", "esperanto ceho")]
+    #[case("Đorđe ı", "Đorđe ı", "đorđe ı")]
+    #[case("\u{212B}", "A", "a")]
+    #[case("Gísli Örn Garðarsson", "Gisli Orn Garðarsson", "gisli orn garðarsson")]
+    #[case("a\u{FFFD}b", "ab", "ab")]
+    #[case("\u{10400} Zoë", "\u{10400} Zoe", "\u{10428} zoe")]
+    fn the_nfd_fold_is_frozen(#[case] input: &str, #[case] removed: &str, #[case] clean: &str) {
+        assert_eq!(remove_diacritics_nfd(input), removed, "{input}");
+        assert_eq!(get_clean_value_nfd(input), clean, "{input}");
     }
 
     #[rstest]
@@ -718,7 +1158,7 @@ mod tests {
     #[case("H. Jon Benjamin", "h jon benjamin")]
     #[case("Warner Bros. Pictures", "warner bros pictures")]
     #[case("ΟΣ", "οσ")] // simple casing: no final-sigma context
-    #[case("𐐀", "𐐨")]
+    #[case("𐐀", "")] // .NET's regex sees two surrogates, neither a letter
     #[case("Béla   Tarr!!", "bela tarr")] // fold, lowercase, punctuation to space, collapse
     #[case("A,B;C", "a b c")]
     #[case(

@@ -77,6 +77,37 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// as its partition size in conflict groups (upstream batches 500).
 pub(crate) const REPAIR_PARTITION: i64 = 10_000;
 
+/// The `(stored, re-derived)` clean value
+/// [`FerrofinItemPersistenceService::repair_diacritic_folds`] rewrites: `stored`
+/// is what builds before gl-1908 derived from `source`, and the derivation now
+/// gives another. An ASCII source derives the same either way.
+fn refolded_clean_value(source: Option<&str>, stored: Option<&str>) -> Option<(String, String)> {
+    let source = source.filter(|source| !source.is_ascii())?;
+    let previous = ferrofin_util::string_extensions::get_clean_value_nfd(source);
+    let want = get_clean_value(source);
+    (stored == Some(previous.as_str()) && want != previous).then_some((previous, want))
+}
+
+/// The `(stored, re-derived)` sort name
+/// [`FerrofinItemPersistenceService::repair_diacritic_folds`] rewrites: `stored`
+/// is what builds before gl-1908 derived from the row's non-ASCII
+/// `ForcedSortName` (when set) or `Name`, and the row's sort name derivation
+/// ([`crate::kinds::fallback_sort_name`]) now gives another.
+fn refolded_sort_name(row: &BaseItemEntity, stored: Option<&str>) -> Option<(String, String)> {
+    let source = row
+        .forced_sort_name
+        .as_deref()
+        .filter(|forced| !forced.is_empty())
+        .or(row.name.as_deref())
+        .filter(|source| !source.is_ascii())?;
+    let previous = ferrofin_util::sort_name::nfd_folded_sort_name(source);
+    if stored != Some(previous.as_str()) {
+        return None;
+    }
+    let want = crate::kinds::fallback_sort_name(row)?;
+    (want != previous).then_some((previous, want))
+}
+
 /// One `Season` row as `recompute_season_keys` reads it:
 /// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
 type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
@@ -1762,6 +1793,179 @@ impl FerrofinItemPersistenceService {
             }
         }
         self.mark_repair_done(META_KEY).await?;
+        Ok(repaired)
+    }
+
+    /// One-shot startup pass that moves the `CleanName`, `SortName` and
+    /// `ItemValues.CleanValue` earlier builds stored for non-ASCII names onto
+    /// upstream's `RemoveDiacritics`, the `Diacritics` package's table, which
+    /// keeps combining marks and the letters it does not list (gl-1908): a
+    /// person stored as `Zoe\u{308} Saldan\u{303}a` was cleaned to
+    /// `zoe saldana`, and Jellyfin 12.4 derives `zoe saldan a`. A clean value
+    /// also drops the characters outside the Basic Multilingual Plane now, as
+    /// .NET's regex does (`𠀀大` cleans to `大`).
+    ///
+    /// A column is rewritten only when it holds the key those builds derived
+    /// (with [`ferrofin_util::string_extensions::remove_diacritics_nfd`]:
+    /// [`ferrofin_util::string_extensions::get_clean_value_nfd`],
+    /// [`ferrofin_util::sort_name::nfd_folded_sort_name`]) and the derivation
+    /// now gives another. Jellyfin's own keys, a person's verbatim sort name
+    /// and anything else stored are left alone. Each write is conditional on
+    /// the stored key, so a row the previous version saves during a rolling
+    /// update is not overwritten; it keeps its old key until its next save.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under
+    /// `diacritics_package_names_v1`. Returns the number of columns rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a read or a partition's write fails; the
+    /// marker is written only after the last partition, so the pass resumes on
+    /// the next boot.
+    pub async fn repair_diacritic_folds(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "diacritics_package_names_v1";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let repaired = self.refold_item_names().await? + self.refold_item_values().await?;
+        self.mark_repair_done(META_KEY).await?;
+        Ok(repaired)
+    }
+
+    /// [`Self::repair_diacritic_folds`] over `BaseItems`: `CleanName` from
+    /// `Name`, `SortName` from `ForcedSortName` (when set) or `Name`.
+    async fn refold_item_names(&self) -> Result<u64, ServiceError> {
+        let mut repaired: u64 = 0;
+        let mut last_id = String::new();
+        loop {
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+            )> = sqlx::query_as(
+                r#"SELECT "Id", "Type", "Name", "ForcedSortName", "SortName", "CleanName",
+                          "ParentIndexNumber", "IndexNumber"
+                   FROM "BaseItems" WHERE "Id" > ?1 ORDER BY "Id" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, ..)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (
+                id,
+                type_,
+                name,
+                forced_sort_name,
+                sort_name,
+                clean_name,
+                parent_index_number,
+                index_number,
+            ) in rows
+            {
+                let row = BaseItemEntity {
+                    type_,
+                    name,
+                    forced_sort_name,
+                    parent_index_number,
+                    index_number,
+                    ..BaseItemEntity::default()
+                };
+                if let Some((previous, want)) =
+                    refolded_clean_value(row.name.as_deref(), clean_name.as_deref())
+                {
+                    let written = sqlx::query(
+                        r#"UPDATE "BaseItems" SET "CleanName" = ?2
+                           WHERE "Id" = ?1 AND "CleanName" = ?3"#,
+                    )
+                    .bind(&id)
+                    .bind(&want)
+                    .bind(&previous)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    repaired += written.rows_affected();
+                }
+                let Some((previous, want)) = refolded_sort_name(&row, sort_name.as_deref()) else {
+                    continue;
+                };
+                tracing::debug!(item_id = %id, old = %previous, new = %want, "sort name refolded");
+                let written = sqlx::query(
+                    r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1 AND "SortName" = ?3"#,
+                )
+                .bind(&id)
+                .bind(&want)
+                .bind(&previous)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                repaired += written.rows_affected();
+            }
+            tx.commit().await.map_err(db_err)?;
+            if !full_partition {
+                break;
+            }
+        }
+        Ok(repaired)
+    }
+
+    /// [`Self::repair_diacritic_folds`] over `ItemValues`: `CleanValue` from
+    /// `Value`.
+    async fn refold_item_values(&self) -> Result<u64, ServiceError> {
+        let mut repaired: u64 = 0;
+        let mut last_id = String::new();
+        loop {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                r#"SELECT "ItemValueId", "Value", "CleanValue" FROM "ItemValues"
+                   WHERE "ItemValueId" > ?1 ORDER BY "ItemValueId" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, _, _)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (id, value, stored) in rows {
+                let Some((previous, want)) = refolded_clean_value(Some(&value), Some(&stored))
+                else {
+                    continue;
+                };
+                let written = sqlx::query(
+                    r#"UPDATE "ItemValues" SET "CleanValue" = ?2
+                       WHERE "ItemValueId" = ?1 AND "CleanValue" = ?3"#,
+                )
+                .bind(&id)
+                .bind(&want)
+                .bind(&previous)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                repaired += written.rows_affected();
+            }
+            tx.commit().await.map_err(db_err)?;
+            if !full_partition {
+                break;
+            }
+        }
         Ok(repaired)
     }
 
@@ -13660,6 +13864,146 @@ mod tests {
         );
         assert_eq!(
             db.meta_get("transliterated_sort_names_v1")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    /// gl-1908: the `CleanName`, `SortName` and `CleanValue` earlier builds
+    /// derived with the NFD fold move to Jellyfin 12.4's; Jellyfin's keys,
+    /// keys no derivation gave, a person's verbatim sort name and ASCII names
+    /// stay; the pass runs once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one seeded table, read back row by row
+    async fn the_diacritic_repair_moves_nfd_folded_keys_once() {
+        use BaseItemKind::{Movie, Person};
+        let zoe = "Zoe\u{308} Saldan\u{303}a";
+        let shalom = "\u{5E9}\u{5B8}\u{5C1}\u{5DC}\u{5D5}\u{5B9}\u{5DD}";
+        let muhammad = "\u{645}\u{64F}\u{62D}\u{64E}\u{645}\u{651}\u{64E}\u{62F}";
+        // (kind, name, forced sort name, stored clean, stored sort, clean after, sort after)
+        #[allow(clippy::type_complexity)]
+        let rows: [(BaseItemKind, &str, Option<&str>, &str, &str, &str, &str); 10] = [
+            // The fold dropped the marks; Jellyfin keeps them, and cleans each
+            // to a space. A person's sort name is its name, verbatim.
+            (Person, zoe, None, "zoe saldana", zoe, "zoe saldan a", zoe),
+            // `ß` was split; the table keeps it (transliteration folds it in
+            // the sort key either way).
+            (
+                Movie, "Straße", None, "strasse", "strasse", "straße", "strasse",
+            ),
+            // Pointed Arabic: the harakat were dropped before both keys.
+            (Movie, muhammad, None, "محمد", "mhmd", "م ح م د", "muhamad"),
+            // …and the sort key derives from a forced sort name when set.
+            (
+                Movie,
+                "Plain title",
+                Some(muhammad),
+                "plain title",
+                "mhmd",
+                "plain title",
+                "muhamad",
+            ),
+            // Pointed Hebrew: ICU4X's Hebrew-Latin drops the points itself, so
+            // only the clean name moves.
+            (Movie, shalom, None, "שלום", "slwm", "ש לו ם", "slwm"),
+            // `Đ` was kept; the table maps it.
+            (Movie, "Đorđe", None, "đorđe", "dorde", "dorde", "dorde"),
+            // A letter outside the BMP was kept; .NET's regex cleans it away.
+            (
+                Movie,
+                "\u{20000}大",
+                None,
+                "\u{20000}大",
+                "custom",
+                "大",
+                "custom",
+            ),
+            // Jellyfin's keys, and keys no derivation gave: left alone.
+            (
+                Movie,
+                zoe,
+                None,
+                "zoe saldan a",
+                "zoe saldana",
+                "zoe saldan a",
+                "zoe saldana",
+            ),
+            (
+                Movie, "Straße", None, "custom", "custom", "custom", "custom",
+            ),
+            (Movie, "Plain", None, "plain", "plain", "plain", "plain"),
+        ];
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let mut ids = Vec::new();
+        for (n, (kind, name, forced, clean, sort, ..)) in (0x7B00_u128..).zip(rows) {
+            let id = Uuid::from_u128(n);
+            crate::test_support::seed_named_item(&db, id, kind, name).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ForcedSortName" = ?2, "CleanName" = ?3, "SortName" = ?4
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(forced)
+            .bind(clean)
+            .bind(sort)
+            .execute(db.writer())
+            .await
+            .expect("keys");
+            ids.push(id);
+        }
+        // (value, stored clean, clean after)
+        let values = [
+            ("Ciência", "ciencia", "ciencia"),
+            ("Saldan\u{303}a", "saldana", "saldan a"),
+            ("Ẓāhir", "custom", "custom"),
+        ];
+        for (n, (value, clean, _)) in values.into_iter().enumerate() {
+            sqlx::query(
+                r#"INSERT INTO "ItemValues" ("ItemValueId", "Type", "Value", "CleanValue")
+                   VALUES (?1, 2, ?2, ?3)"#,
+            )
+            .bind(format!("v{n}"))
+            .bind(value)
+            .bind(clean)
+            .execute(db.writer())
+            .await
+            .expect("value");
+        }
+
+        // Six clean names, the two Arabic sort names and Saldaña's clean value.
+        assert_eq!(service.repair_diacritic_folds().await.expect("repair"), 9);
+        for (id, (_, name, _, _, _, clean, sort)) in ids.into_iter().zip(rows) {
+            let stored: (Option<String>, Option<String>) = sqlx::query_as(
+                r#"SELECT "CleanName", "SortName" FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("read back");
+            assert_eq!(
+                stored,
+                (Some(clean.to_owned()), Some(sort.to_owned())),
+                "{name}"
+            );
+        }
+        for (n, (value, _, clean)) in values.into_iter().enumerate() {
+            let stored: String = sqlx::query_scalar(
+                r#"SELECT "CleanValue" FROM "ItemValues" WHERE "ItemValueId" = ?1"#,
+            )
+            .bind(format!("v{n}"))
+            .fetch_one(db.pool())
+            .await
+            .expect("read back");
+            assert_eq!(stored, clean, "{value}");
+        }
+
+        // Second boot: nothing to do.
+        assert_eq!(service.repair_diacritic_folds().await.expect("repair"), 0);
+        assert_eq!(
+            db.meta_get("diacritics_package_names_v1")
                 .await
                 .expect("meta")
                 .as_deref(),
