@@ -223,6 +223,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
             carried: CarriedRows::default(),
             counts: FirstStartCounts::default(),
             art: ArtRelocation::default(),
+            data: 0,
         }
     );
     assert_eq!(summary.left_out.len(), 0);
@@ -1304,8 +1305,9 @@ async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
 /// that recorded, a series timer, a channel and a programme item with a
 /// user's favourite) and an LDAP-Auth link: the export reads what Jellyfin
 /// keeps in files before it drops Ferrofin's tables, keeps the items Jellyfin
-/// reads with the favourite on them (gl-1556), and leaves the source byte for
-/// byte as it was.
+/// reads with the favourite on them (gl-1556), writes the channel's `Data` in
+/// Jellyfin's shape (gl-1630), and leaves the source byte for byte as it was;
+/// a second export writes the same database.
 #[tokio::test]
 async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1348,6 +1350,22 @@ async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
         ],
         "the channel and the programme are kept, the favourite with them"
     );
+    // The channel's Data in the shape Jellyfin 12.4 serialises it (gl-1630);
+    // the programme's kind keeps none.
+    assert_eq!(summary.edits.data, 1);
+    let channel: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Data" FROM "BaseItems"
+           WHERE "Type" = 'MediaBrowser.Controller.LiveTv.LiveTvChannel'"#,
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        channel.as_deref(),
+        Some(
+            r#"{"ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"DateLastSaved":"0001-01-01T00:00:00.0000000Z","RemoteTrailers":[]}"#
+        )
+    );
     let left: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name GLOB 'Ferrofin*'",
     )
@@ -1355,6 +1373,15 @@ async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
     .await
     .unwrap();
     assert_eq!(left, 0);
+    // A second export of the source writes the same database (gl-1630).
+    let again = scratch.path().join("again");
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &again, BUILD)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(out.join(EXPORTED_DATABASE)).unwrap(),
+        std::fs::read(again.join(EXPORTED_DATABASE)).unwrap()
+    );
 }
 
 /// A migrated Ferrofin database at `database` holding Live TV and an LDAP-Auth

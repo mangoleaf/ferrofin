@@ -34,6 +34,12 @@ impl Layout {
         format!("{}/{METADATA}", self.program_data)
     }
 
+    /// Its data directory, Jellyfin's `DataPath`: `{program data}/data`.
+    #[must_use]
+    pub fn data(&self) -> String {
+        format!("{}/{DATA}", self.program_data)
+    }
+
     /// Where `dir`, one of its directories, is in the output: its place under
     /// program data. A directory outside program data has none (the export
     /// writes one directory).
@@ -64,6 +70,9 @@ pub(super) const CONFIG: &str = "config";
 
 /// The metadata directory's place under program data, likewise.
 pub(super) const METADATA: &str = "metadata";
+
+/// The data directory's place under program data, likewise.
+pub(super) const DATA: &str = "data";
 
 /// The directories of the stopped server an export reads, as the export
 /// reaches them.
