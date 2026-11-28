@@ -2658,7 +2658,8 @@ pub struct OwnerExtrasRefresh {
     /// extra is owned by the version it is named after).
     pub owner: Uuid,
     /// The extras of `owner` the refresh found, when it looked for all of
-    /// them (`FindExtras`, run by a library scan); `None` when it did not.
+    /// them (`FindExtras`, run by a library scan and by the owner's own
+    /// refresh); `None` when it did not.
     pub found: Option<Vec<Uuid>>,
     /// Whether the refresh created, re-owned or renamed one of them, or
     /// ran in full (`FullRefresh` or "Replace all metadata").

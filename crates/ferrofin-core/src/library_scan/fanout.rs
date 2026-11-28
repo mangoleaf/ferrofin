@@ -125,6 +125,7 @@ struct Effects {
     album_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
     folder_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
     episode_folders: std::collections::HashMap<String, super::EpisodeFolder>,
+    refound: std::collections::HashSet<uuid::Uuid>,
 }
 
 impl Effects {
@@ -141,6 +142,7 @@ impl Effects {
             album_ancestors: ctx.album_ancestors.into_inner(),
             folder_ancestors: ctx.folder_ancestors.into_inner(),
             episode_folders: ctx.episode_folders.into_inner(),
+            refound: ctx.refound.into_inner(),
         }
     }
 
@@ -162,6 +164,7 @@ impl Effects {
         ctx.episode_folders
             .borrow_mut()
             .extend(self.episode_folders);
+        ctx.refound.borrow_mut().extend(self.refound);
     }
 }
 
