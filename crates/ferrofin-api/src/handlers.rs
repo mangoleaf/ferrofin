@@ -2948,7 +2948,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    a line feed for a referenced carriage return as well, which ReadInnerXml \
                    writes out raw for the second reader; and an attribute value (a \
                    <uniqueid>'s type) holds one space for a line end or a tab and keeps a \
-                   referenced one, on both servers before and after. \
+                   referenced one, on both servers before and after. An OPF's attribute \
+                   value is as the document holds it instead: XmlDocument.Load's reader has \
+                   Normalization off for it too, Jellyfin 12.4 stores the line ends and the \
+                   tab of a calibre:series attribute, and XmlCursor::as_written reads a value \
+                   with its references resolved and nothing else changed. \
                    Behind an M3U tuner, the programme titles and overviews of \
                    guides in nine legacy encodings, each holding a sequence with no \
                    character, are the same on both servers after a guide refresh, where none \

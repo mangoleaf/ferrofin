@@ -8,10 +8,11 @@
 //! flat `XmlToken` list (entities unescaped, adjacent text coalesced) and then
 //! exposes an [`XmlCursor`] over it that re-creates the reader contract.
 //!
-//! Line ends are the reader's too: [`XmlCursor::new`] and
-//! [`XmlCursor::up_to_error`] read CR LF and a lone CR as one line feed, as
-//! `XmlReader.Create` does; [`XmlCursor::as_written`] is for the one loader
-//! that does not (`XmlDocument.Load`).
+//! Normalization is the reader's too: [`XmlCursor::new`] and
+//! [`XmlCursor::up_to_error`] read CR LF and a lone CR as one line feed, and
+//! white space in an attribute value as a space, as `XmlReader.Create` does;
+//! [`XmlCursor::as_written`] is for the one loader that does neither
+//! (`XmlDocument.Load`).
 //!
 //! Only the surface the parsers actually use is implemented; unused `XmlReader`
 //! features (namespaces, attribute-node navigation, DTDs) are omitted.
@@ -75,8 +76,8 @@ pub struct XmlError;
 /// surfaces a single text node between elements). Comments and processing
 /// instructions are skipped (matching `IgnoreComments`/
 /// `IgnoreProcessingInstructions`). Returns [`XmlError`] on a malformed document.
-fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
-    match tokenize_until_error(xml) {
+fn tokenize(xml: &str, normalization: bool) -> Result<Vec<XmlToken>, XmlError> {
+    match tokenize_until_error(xml, normalization) {
         (tokens, true) => Ok(tokens),
         (_, false) => Err(XmlError),
     }
@@ -90,8 +91,18 @@ fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
 /// walks a child with `ReadSubtree` and sets fields as it goes, `<ratings>`
 /// for one, keeps the values before the error upstream; dropping the whole
 /// child is the approximation here.)
-fn tokenize_until_error(xml: &str) -> (Vec<XmlToken>, bool) {
-    let mut reader = Reader::from_str(xml);
+///
+/// `normalization` is `XmlTextReader.Normalization`, on for a reader
+/// `XmlReader.Create` makes and off for `XmlDocument.Load`'s: line ends in
+/// the document ([`line_feeds`]) and white space in an attribute value
+/// ([`read_attrs`]).
+fn tokenize_until_error(xml: &str, normalization: bool) -> (Vec<XmlToken>, bool) {
+    let xml = if normalization {
+        line_feeds(xml)
+    } else {
+        Cow::Borrowed(xml)
+    };
+    let mut reader = Reader::from_str(&xml);
     let config = reader.config_mut();
     config.check_end_names = false;
     config.trim_text(false);
@@ -103,7 +114,7 @@ fn tokenize_until_error(xml: &str) -> (Vec<XmlToken>, bool) {
 
     loop {
         let read = match reader.read_event() {
-            Ok(Event::Start(e)) => read_attrs(&e).map(|attributes| {
+            Ok(Event::Start(e)) => read_attrs(&e, normalization).map(|attributes| {
                 tokens.push(XmlToken::Start {
                     name: local_name(&e),
                     attributes,
@@ -113,7 +124,7 @@ fn tokenize_until_error(xml: &str) -> (Vec<XmlToken>, bool) {
                     complete = tokens.len();
                 }
             }),
-            Ok(Event::Empty(e)) => read_attrs(&e).map(|attributes| {
+            Ok(Event::Empty(e)) => read_attrs(&e, normalization).map(|attributes| {
                 tokens.push(XmlToken::Empty {
                     name: local_name(&e),
                     attributes,
@@ -157,16 +168,26 @@ fn tokenize_until_error(xml: &str) -> (Vec<XmlToken>, bool) {
 }
 
 /// Reads a start/empty element's attributes as `(local-name, unescaped-value)`.
-fn read_attrs(e: &quick_xml::events::BytesStart<'_>) -> Result<Vec<(String, String)>, XmlError> {
+///
+/// With `normalization`, a value is normalised as the XML rule has it: a line
+/// end or a tab the document holds is one space, CR LF one too, and a
+/// character reference stays. Without, it is the value as written, its
+/// references resolved (both measured on Jellyfin 12.4, gl-2033).
+fn read_attrs(
+    e: &quick_xml::events::BytesStart<'_>,
+    normalization: bool,
+) -> Result<Vec<(String, String)>, XmlError> {
     let mut attrs = Vec::new();
     for attr in e.attributes() {
         let attr = attr.map_err(|_| XmlError)?;
         let key = attr.key.local_name().as_ref().to_owned();
-        let value = attr
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map_err(|_| XmlError)?
-            .into_owned();
-        attrs.push((key, value));
+        let value = if normalization {
+            attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|_| XmlError)?
+        } else {
+            quick_xml::escape::unescape(&attr.value).map_err(|_| XmlError)?
+        };
+        attrs.push((key, value.into_owned()));
     }
     Ok(attrs)
 }
@@ -216,18 +237,22 @@ impl XmlCursor {
     /// Returns [`XmlError`] if the document cannot be tokenized (the parsers
     /// treat this the same as a caught `XmlException`).
     pub fn new(xml: &str) -> Result<Self, XmlError> {
-        Self::as_written(&line_feeds(xml))
+        Ok(Self {
+            tokens: tokenize(xml, true)?,
+            pos: 0,
+        })
     }
 
     /// [`Self::new`] for a document `XmlDocument.Load` reads: its
     /// `XmlTextReader` has `Normalization` off, so the text keeps the line
-    /// ends the document holds (an OPF, measured on Jellyfin 12.4, gl-2029).
+    /// ends the document holds and an attribute value its white space (an
+    /// OPF, measured on Jellyfin 12.4, gl-2029 and gl-2033).
     ///
     /// # Errors
     /// Returns [`XmlError`] if the document cannot be tokenized.
     pub fn as_written(xml: &str) -> Result<Self, XmlError> {
         Ok(Self {
-            tokens: tokenize(xml)?,
+            tokens: tokenize(xml, false)?,
             pos: 0,
         })
     }
@@ -238,7 +263,7 @@ impl XmlCursor {
     /// ends are read as [`Self::new`] reads them.
     #[must_use]
     pub fn up_to_error(xml: &str) -> (Self, bool) {
-        let (tokens, clean) = tokenize_until_error(&line_feeds(xml));
+        let (tokens, clean) = tokenize_until_error(xml, true);
         (Self { tokens, pos: 0 }, clean)
     }
 
@@ -518,7 +543,7 @@ mod entity_tests {
         #[case] expected: &[&str],
         #[case] clean: bool,
     ) {
-        let (tokens, whole) = tokenize_until_error(xml);
+        let (tokens, whole) = tokenize_until_error(xml, true);
         assert_eq!(names(&tokens), expected, "{xml}");
         assert_eq!(whole, clean, "{xml}");
     }
@@ -527,6 +552,7 @@ mod entity_tests {
     fn text_entities_and_cdata_coalesce_without_losing_spaces() {
         let tokens = tokenize(
             "<title>Fish &amp; Chips &#x1F3B5; <![CDATA[<mix>]]> &quot;Live&quot;</title>",
+            true,
         )
         .expect("valid XML");
         assert_eq!(
@@ -539,6 +565,9 @@ mod entity_tests {
 
     #[test]
     fn unknown_entities_are_rejected() {
-        assert!(tokenize("<title>&missing;</title>").is_err());
+        assert!(tokenize("<title>&missing;</title>", true).is_err());
+        // In an attribute too, whichever way its value is read.
+        assert!(tokenize(r#"<a b="&missing;"/>"#, true).is_err());
+        assert!(tokenize(r#"<a b="&missing;"/>"#, false).is_err());
     }
 }

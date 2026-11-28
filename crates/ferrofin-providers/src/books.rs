@@ -426,7 +426,7 @@ enum LineEnds {
     /// character reference (`&#13;`) is not a line end and stays.
     Normalized,
     /// `XmlDocument.Load`, whose `XmlTextReader` has `Normalization` off: the
-    /// text is as the document holds it.
+    /// text is as the document holds it, and so is an attribute value.
     AsWritten,
 }
 
@@ -3803,6 +3803,43 @@ mod tests {
                 .and_then(|b| b.overview)
                 .as_deref(),
             Some("one\r\ntwo\rthree\nfour [\r\n] [x\ry\r\nz]")
+        );
+    }
+
+    /// `XmlDocument.Load`'s reader has `Normalization` off for an attribute
+    /// value too: Jellyfin 12.4 stores the line ends and the tab an OPF's
+    /// `calibre:series` attribute holds as the document has them, where
+    /// `XmlReader.Create` reads each as one space (an NFO's attribute).
+    #[rstest::rstest]
+    #[case::sidecar(false)]
+    #[case::epub(true)]
+    fn an_opfs_attribute_keeps_its_white_space_as_written(#[case] epub: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opf = "<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\r\n<metadata>\r\n\
+                   <dc:title>T</dc:title>\r\n<meta name=\"calibre:series\" \
+                   content=\"crlf[\r\n] cr[\r] lf[\n] tab[\t] ref[&#13;&#10;&#9;]\"/>\r\n\
+                   </metadata>\r\n</package>\r\n";
+        let path = if epub {
+            let container = br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#;
+            write_archive(
+                &dir,
+                "book.epub",
+                &[
+                    ("META-INF/container.xml", container),
+                    ("content.opf", opf.as_bytes()),
+                ],
+                None,
+            )
+        } else {
+            std::fs::write(dir.path().join("book.mobi"), b"book").expect("write book");
+            std::fs::write(dir.path().join("book.opf"), opf).expect("write opf");
+            dir.path().join("book.mobi").to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            read_book_metadata(&path)
+                .and_then(|b| b.series_name)
+                .as_deref(),
+            Some("crlf[\r\n] cr[\r] lf[\n] tab[\t] ref[\r\n\t]")
         );
     }
 
