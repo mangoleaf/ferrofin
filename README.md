@@ -116,10 +116,12 @@ apt repository, ships a systemd unit): add the repository, then
 `apt-get install ./ferrofin_<version>_<arch>.deb` from the releases page. The full walk-through,
 including the plain release tarball, is [`docs/INSTALL.md`](docs/INSTALL.md).
 
-**From source** (needs the pinned Rust toolchain, a C compiler, cmake, and on x86-64 nasm;
-ffmpeg is optional and its absence only disables transcoding):
+**From source** (needs the pinned Rust toolchain, a C compiler, cmake, curl, and on x86-64 nasm;
+ffmpeg is optional and its absence only disables transcoding). The first command downloads the
+libjpeg-turbo release the build links, checks it and builds it, once per checkout:
 
 ```sh
+scripts/libjpeg-turbo.sh
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 

@@ -1,6 +1,8 @@
 # Keep the docker build context small — the root Dockerfile builds from the repo root.
 # (suite/ stays ignored defensively: retired v2 data dirs may linger on old checkouts.)
 **/target/
+# The image builds its own libjpeg-turbo (scripts/libjpeg-turbo.sh); never the host's.
+**/libjpeg-turbo.sh.out/
 **/.git
 suite/
 suite.*/

@@ -58,7 +58,8 @@ pub fn read_playlist_file(path: &str, contents: &str) -> Vec<PathBuf> {
 /// ([`ferrofin_util::escape_charset::detect`]). Bytes that are valid UTF-8 with
 /// no ESC byte are UTF-8, and anything else is decoded in the encoding
 /// [`chardetng`] guesses: ISO-2022-JP first, otherwise UTF-8 or a legacy
-/// encoding (an old Winamp `.m3u` is usually Windows-1252).
+/// encoding (an old Winamp `.m3u` is usually Windows-1252), read through
+/// [`ferrofin_util::code_page::decode`].
 #[must_use]
 pub fn decode_playlist(bytes: &[u8]) -> String {
     if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(bytes) {
@@ -79,11 +80,8 @@ pub fn decode_playlist(bytes: &[u8]) -> String {
     }
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    detector
-        .guess(None, chardetng::Utf8Detection::Allow)
-        .decode(bytes)
-        .0
-        .into_owned()
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
+    ferrofin_util::code_page::decode(encoding, bytes)
 }
 
 /// Where a playlist's `playlist.xml` metadata lives — port of
@@ -502,6 +500,43 @@ mod tests {
         assert_eq!(
             decode_playlist(b"~{VPND~}/~{WVD;~}.mp3\n~~1.mp3\n"),
             "中文/字幕.mp3\n~1.mp3\n"
+        );
+    }
+
+    /// Code page 949's user-defined rows C9 and FE are the Private Use Area
+    /// from U+E000, which Jellyfin 12.4 decodes them to (gl-2000). The folder
+    /// name is enough Korean that chardetng keeps EUC-KR beside the two
+    /// user-defined pairs, which it counts against the charset.
+    #[test]
+    fn a_korean_playlist_keeps_its_user_defined_characters() {
+        let folder = "이 영화는 정말 재미있습니다. 우리는 내일 다시 만날 것입니다. 그는 집에 가고 싶어 합니다. 안녕하세요, 만나서 반갑습니다.".repeat(4);
+        let (korean, _, _) = encoding_rs::EUC_KR.encode(&folder);
+        let playlist = [
+            &korean[..],
+            b"/\xc9\xa1.mp3\n",
+            &korean[..],
+            b"/\xfe\xfe.mp3\n",
+        ]
+        .concat();
+        assert_eq!(
+            decode_playlist(&playlist),
+            format!("{folder}/\u{E000}.mp3\n{folder}/\u{E0BB}.mp3\n")
+        );
+    }
+
+    /// A byte pair with no character is what .NET's decoder writes for it,
+    /// as Jellyfin 12.4 reads it (gl-2010): U+30FB in Shift_JIS, where
+    /// `encoding_rs` alone answers U+FFFD and reads the `@` again. The folder
+    /// name is enough Japanese that chardetng keeps Shift_JIS beside the
+    /// pair, which it counts against the charset.
+    #[test]
+    fn a_japanese_playlist_reads_an_unassigned_pair_as_dotnet_does() {
+        let folder = "これは日本語の字幕です。あなたはどこにいますか。".repeat(40);
+        let (japanese, _, _) = encoding_rs::SHIFT_JIS.encode(&folder);
+        let playlist = [&japanese[..], b"/\x82\x40.mp3\n"].concat();
+        assert_eq!(
+            decode_playlist(&playlist),
+            format!("{folder}/\u{30FB}.mp3\n")
         );
     }
 

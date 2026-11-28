@@ -81,6 +81,15 @@ deny = [
     { crate = "ring", reason = "aws-lc-rs is the one rustls crypto provider" },
 ]
 
+# Every build links the libjpeg-turbo release that scripts/libjpeg-turbo.sh pins and builds.
+# turbojpeg-sys with `cmake` on compiles the older one it vendors instead, and with `pkg-config`
+# on links whatever the system has, so neither feature may come back, through `turbojpeg` or
+# through another crate.
+[[bans.features]]
+crate = "turbojpeg-sys"
+deny = ["cmake", "pkg-config"]
+reason = "libjpeg-turbo comes from scripts/libjpeg-turbo.sh's pinned release only"
+
 [bans.workspace-dependencies]
 # A dependency several crates declare apart from the root [workspace.dependencies] (CLAUDE.md),
 # and a workspace entry nothing uses. One crate's lone inline version passes this;

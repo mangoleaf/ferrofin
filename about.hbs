@@ -8,11 +8,41 @@ file beside this one), built together with the Rust standard library (MIT OR
 Apache-2.0) and the third-party Rust crates and C libraries below, which keep
 their own licenses. Each section that follows is one license text and the
 crates it covers. The C libraries are compiled from the -sys crates that
-carry them: AWS-LC (aws-lc-sys), jemalloc (tikv-jemalloc-sys), libjpeg-turbo
-(turbojpeg-sys), libwebp (libwebp-sys) and SQLite (libsqlite3-sys; public
-domain).
+carry them: AWS-LC (aws-lc-sys), jemalloc (tikv-jemalloc-sys), libwebp
+(libwebp-sys) and SQLite (libsqlite3-sys; public domain). libjpeg-turbo is
+compiled from its own release source and linked through turbojpeg-sys.
 
 This software is based in part on the work of the Independent JPEG Group.
+
+libjpeg-turbo's TurboJPEG API library is under the Modified (3-clause) BSD
+License:
+
+Copyright (C) 2009-2026 D. R. Commander
+Copyright (C) 2018-2023 Randy <randy408@protonmail.com>
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+- Neither the name of the libjpeg-turbo Project nor the names of its
+  contributors may be used to endorse or promote products derived from this
+  software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS",
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
 
 A crate that ships no license file of its own is listed under the license's
 standard text, with its authors as its crate manifest names them.

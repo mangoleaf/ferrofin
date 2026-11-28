@@ -1007,8 +1007,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// login via the provider, which logs the session out again. `200
 /// {"Downloads": n}` means the credentials work (the account's allowed
 /// downloads); a rejected login is `401 {"Message": …}`, a missing account and
-/// API key override `400`. The API key is optional when account credentials
-/// are provided (Jellyfin's shared key is used).
+/// API key override `400`, and a disabled OpenSubtitles plugin `404`, as
+/// upstream's unloaded controller does. The API key is optional when account
+/// credentials are provided (Jellyfin's shared key is used).
 ///
 /// The body binds like every MVC body (member names ignoring case), then
 /// reaches the provider in its canonical PascalCase.

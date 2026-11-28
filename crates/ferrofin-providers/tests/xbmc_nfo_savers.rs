@@ -292,3 +292,37 @@ fn movie_round_trip_synthetic_full() {
         "synthetic round trip mismatch\n--- serialized ---\n{serialized}"
     );
 }
+
+/// A multi-line overview through the saver and back through the parser, as
+/// on Jellyfin 12.4: `XmlWriter` (`NewLineHandling.Replace`, its default)
+/// writes CR LF and a lone CR in text as its newline, a line feed here, so
+/// the file holds line feeds and `XmlReader` reads them back (gl-2033; for
+/// the second overview Jellyfin wrote `<plot>Round one\nRound two\nRound
+/// three\nRound four</plot>`).
+#[rstest::rstest]
+#[case::line_feeds("one\ntwo\nthree", "one\ntwo\nthree")]
+#[case::carriage_returns(
+    "Round one\r\nRound two\rRound three\nRound four",
+    "Round one\nRound two\nRound three\nRound four"
+)]
+fn a_multi_line_overview_is_saved_and_read_back_with_line_feeds(
+    #[case] stored: &str,
+    #[case] saved: &str,
+) {
+    let mut result = new_result(NfoItemKind::Movie);
+    result.item.overview = Some(stored.to_owned());
+    let nfo = save_movie(&result, &NfoConfiguration::default());
+    assert!(nfo.contains(&format!("<plot>{saved}</plot>")), "{nfo:?}");
+
+    let mut read_back = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut read_back,
+        "movie.nfo",
+        &nfo,
+        &NfoConfiguration::default(),
+        &all_ids(),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(read_back.item.overview.as_deref(), Some(saved));
+}
