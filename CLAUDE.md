@@ -212,7 +212,8 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 ## Building, running, testing
 
 ```bash
-cargo build --workspace   # needs cmake, and nasm on x86-64 (the vendored libjpeg-turbo)
+scripts/libjpeg-turbo.sh  # once per checkout: the pinned libjpeg-turbo the build links (needs cmake, curl, and nasm on x86-64)
+cargo build --workspace
 
 # Run the server. Config via flags, FERROFIN_* env, or {data_dir}/config.toml.
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096

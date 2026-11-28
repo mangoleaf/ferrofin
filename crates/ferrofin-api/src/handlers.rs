@@ -3521,7 +3521,10 @@ macro_rules! item_image_tail {
          none of its range processing) → \
          ferrofin-drawing processor.rs process_image (ImageProcessor.ProcessImage) → \
          image_encoder.rs encode_image and composite (SkiaEncoder.EncodeImage: the blur, \
-         backgroundColor and foregroundLayer steps) → limits.rs ImageMemory. Measured on \
+         backgroundColor and foregroundLayer steps) → limits.rs ImageMemory → \
+         scaled_jpeg.rs for a JPEG (SkiaEncoder.Decode: libjpeg-turbo, the codec inside \
+         Skia; a file cut short or with corrupt data is drawn as far as it decodes, as \
+         SKBitmap.Decode and the unchecked codec.GetPixels take an incomplete one). Measured on \
          12.4 with a BMP and a transparent PNG primary: no transform, quality, Range, \
          If-None-Match, If-Modified-Since (past, the file's own date and future, with and \
          without no-cache), Cache-Control spellings, If-Unmodified-Since, \
@@ -3529,8 +3532,9 @@ macro_rules! item_image_tail {
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
          format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
-         (decoded and resized by libraries other than Skia's; a JPEG is written by \
-         libjpeg-turbo, the codec inside Skia, with SkJpegEncoder's settings)"
+         (resized by another library than Skia's, and every format but JPEG decoded by one; \
+         a JPEG is read by libjpeg-turbo, the codec inside Skia, and written by it with \
+         SkJpegEncoder's settings)"
     };
 }
 
@@ -3556,6 +3560,10 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
      at the source); where Ferrofin does, neither side shrinking (a collage cell or \
      splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
+    "A JPEG is decoded at a reduced DCT scale when one covers twice the output on both \
+     sides, the smallest of 1/8, 1/4 and 1/2 of its size that does (gl-1015), where \
+     SkiaEncoder.Decode reads every image in full: the full-size bitmap is never built, and \
+     the resized pixels are close to a full decode's, not equal to them.",
     "An anonymous request serves an image of an item whose stored Type names no item \
      kind (a removed plugin's item); upstream's GetItemById is null for it, a 404. A \
      signed-in request is a 404 here too. Fix path: gl-1967.",

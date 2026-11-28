@@ -3,7 +3,16 @@
 # release has a week to be found and yanked before it can reach Ferrofin. Cargo reads this file
 # for every command under the repository root, the WASM guest (examples/wasm-hello/) included.
 # `--locked` builds resolve nothing, and `cargo install` ignores it. CONTRIBUTING.md
-# ("Dependency cooldown") has the override. Keep anything else out of this file: it merges with
-# each contributor's own ~/.cargo/config.toml.
+# ("Dependency cooldown") has the override. Keep anything but this and the [env] entry below out of
+# this file: it merges with each contributor's own ~/.cargo/config.toml.
 [registry]
 global-min-publish-age = "7 days"
+
+# The libjpeg-turbo that turbojpeg-sys links, statically: scripts/libjpeg-turbo.sh builds it here
+# from the official release it pins (run it once per checkout, before the first build). The
+# directory carries the pinned version, so it moves with the script's VERSION, and a build finds no
+# library until the script has built that one: turbojpeg-sys then stops with "Cannot canonicalize
+# TURBOJPEG_LIB_DIR" under a line showing this path, which names the script. Not under target/,
+# which CI's cache action cleans. An environment variable of the same name takes precedence.
+[env]
+TURBOJPEG_LIB_DIR = { value = "scripts/libjpeg-turbo.sh.out/3.2.1/lib", relative = true }

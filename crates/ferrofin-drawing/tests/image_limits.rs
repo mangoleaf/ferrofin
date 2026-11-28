@@ -160,6 +160,66 @@ async fn a_jpeg_over_a_limit_takes_no_reduced_scale_either() {
     );
 }
 
+/// gl-1347: a JPEG coded in more than one scan (a progressive one here) makes
+/// libjpeg-turbo hold the coefficients of its whole frame while it decodes, 2
+/// bytes a sample, whatever size it decodes to, and they count against the
+/// decode memory beside the bitmap. 200×200 at 4:2:0 is 120 KB of RGB, and
+/// its planes, padded to whole 16×16 MCUs, are 208×208 luma samples and two
+/// of 104×104 chroma samples.
+#[rstest]
+#[tokio::test]
+async fn a_progressive_jpeg_counts_the_coefficients_its_decode_holds(
+    #[values(false, true)] auto_orient: bool,
+) {
+    const NEEDED: u64 = 120_000 + 2 * (208 * 208 + 2 * 104 * 104);
+    let fixture = Fixture::new();
+    let input = fixture.path("in.jpg");
+    let mut writer = jpeg_encoder::Encoder::new_file(&input, 90).expect("create fixture");
+    writer.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    writer.set_progressive(true);
+    writer
+        .encode(
+            &SMALL_COLOR.repeat(200 * 200),
+            200,
+            200,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .expect("write fixture");
+    let output = fixture.path("out.jpg");
+
+    let a_byte_short = ImageCrateEncoder::new().with_limits(ImageLimits {
+        max_alloc: NEEDED - 1,
+        ..ROOMY
+    });
+    assert_refused(
+        encode(
+            &a_byte_short,
+            &input,
+            &output,
+            auto_orient,
+            &resize_to(50, 50),
+        )
+        .await,
+        "image_decode_max_memory_mb",
+    );
+    assert_refused(
+        a_byte_short.get_image_blur_hash(4, 3, &input).await,
+        "image_decode_max_memory_mb",
+    );
+    assert!(!Path::new(&output).exists());
+
+    let enough = ImageCrateEncoder::new().with_limits(ImageLimits {
+        max_alloc: NEEDED,
+        ..ROOMY
+    });
+    assert_eq!(
+        encode(&enough, &input, &output, auto_orient, &resize_to(50, 50))
+            .await
+            .expect("on the limit"),
+        output
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn a_blur_hash_runs_under_the_limits(
