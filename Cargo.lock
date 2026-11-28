@@ -1881,6 +1881,7 @@ dependencies = [
  "futures-util",
  "http-body",
  "image",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

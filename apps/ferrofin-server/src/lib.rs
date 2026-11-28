@@ -346,6 +346,15 @@ async fn run_lifetimes(
     let _log_guard = init_tracing(&config);
     log_startup_banner(&config);
     log_load_warnings(&config);
+    // After tracing so a failure is logged, and once: the flag holds for the process.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = bootstrap::disable_transparent_huge_pages() {
+        tracing::warn!(
+            %error,
+            "could not opt out of transparent huge pages; on a host whose mode is `always`, \
+             memory the server frees stays resident"
+        );
+    }
     // The Prometheus pipeline is process-global (OTel meter provider + the
     // set-once HTTP instruments), so it lives across in-process restarts.
     let mut metrics = None;

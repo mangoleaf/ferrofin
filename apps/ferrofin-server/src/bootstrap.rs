@@ -190,6 +190,33 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     guard
 }
 
+/// Opts the whole process out of transparent huge pages (`PR_SET_THP_DISABLE`).
+///
+/// On a host whose THP mode is `always`, the kernel backs any 2 MiB stretch of
+/// heap with a whole huge page however little of it is in use, and khugepaged
+/// refills the small pages jemalloc hands back, so memory the server frees
+/// raises its resident memory instead of lowering it. On the benchmark library,
+/// after a scan, three minutes of browsing and a quarter hour idle, the server
+/// held 269 MiB of anonymous memory with huge pages and 47 MiB without. On a host whose mode is `madvise` or `never` this changes nothing
+/// by default; it also overrides an operator's `MALLOC_CONF=thp:always`. Child
+/// processes (ffmpeg, ffprobe) inherit the setting.
+///
+/// # Errors
+/// The `prctl` error: a kernel older than 3.15, or a seccomp policy that
+/// refuses the call.
+#[cfg(target_os = "linux")]
+pub(crate) fn disable_transparent_huge_pages() -> std::io::Result<()> {
+    // The kernel reads each argument as an unsigned long; flags 0 disables THP everywhere, and
+    // the remaining arguments must be 0.
+    let (disable, zero): (libc::c_ulong, libc::c_ulong) = (1, 0);
+    // SAFETY: PR_SET_THP_DISABLE takes integers only and reads or writes no memory of ours.
+    if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, disable, zero, zero, zero) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Lines the file log queues for its writer thread. Once the queue is full (the
 /// disk stalls), a new line is dropped, never waited for: Jellyfin's file sink
 /// sits behind Serilog's `Async` sink, whose default queue holds 10,000 events
@@ -1239,6 +1266,21 @@ async fn validate_binary(
 mod tests {
     use super::*;
     use crate::test_logs::CapturedLogs;
+
+    /// After the opt-out the kernel reports huge pages off for the process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transparent_huge_pages_are_off_after_the_opt_out() {
+        disable_transparent_huge_pages().expect("prctl");
+
+        let status = std::fs::read_to_string("/proc/self/status").expect("status");
+        assert!(
+            status
+                .lines()
+                .any(|line| line.split_whitespace().eq(["THP_enabled:", "0"])),
+            "{status}"
+        );
+    }
 
     /// Startup runs `MakeSanityCheckOrThrow` (`Program.StartApp`): every
     /// server directory exists and carries its `.jellyfin-<kind>` marker, and

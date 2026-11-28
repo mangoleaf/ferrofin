@@ -120,6 +120,10 @@ image.workspace = true
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace = true
 
+# `bootstrap::disable_transparent_huge_pages`: the `prctl` opt-out.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 # ── Debian package (cargo-nfpm, also used by the release workflow) ──
 [package.metadata.nfpm]
 name = "ferrofin"
