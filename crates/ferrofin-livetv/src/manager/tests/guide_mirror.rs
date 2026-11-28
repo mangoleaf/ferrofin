@@ -392,6 +392,7 @@ async fn a_guide_page_reads_its_programme_items_once() {
         let reads = Arc::new(ChannelReads {
             inner,
             reads: Mutex::new(Vec::new()),
+            at_read: Box::new(|| ()),
         });
         recorder = Some(Arc::clone(&reads));
         reads
