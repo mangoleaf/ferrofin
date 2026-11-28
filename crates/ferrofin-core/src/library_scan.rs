@@ -150,6 +150,13 @@ struct ArtworkCache {
     /// request — is recorded too, so neither is re-requested once per
     /// episode.
     season_details: ProviderCache<SeasonKey, SeasonLookup>,
+    /// (series item id, display order, language) → the series' TMDB episode
+    /// group of that order, kept for as long as `TmdbClientManager` would
+    /// keep it ([`LibraryScanner::episode_group_cached`]): every episode of
+    /// the series in that order is looked up through it. A series TMDB lists
+    /// no such group for, and a failed request, are recorded too, so neither
+    /// is asked again per episode.
+    episode_groups: ProviderCache<GroupKey, GroupLookup>,
     /// Series item id → the matched TVDB series details (when the TVDB
     /// provider answered for the series), kept for the TVDB plugin's
     /// `CacheDurationInHours` ([`tvdb_cache`]). Its `tvdb_id` lets episodes
@@ -222,16 +229,29 @@ struct LocaleParent {
     country: Option<String>,
 }
 
-/// One season's `/tv/{id}/season/{n}` lookup, as the scan cached it.
-enum SeasonLookup {
+/// One TMDB lookup as the scan cached it: a season's `/tv/{id}/season/{n}`
+/// ([`SeasonLookup`]) or a series' episode group ([`GroupLookup`]).
+enum TmdbLookup<T> {
     /// TMDB answered.
-    Found(ferrofin_providers::tmdb::SeasonDetails),
-    /// TMDB answered that it has no such season.
+    Found(T),
+    /// TMDB answered that it has no such season, or no such group.
     Missing,
     /// The request failed. Every item that reads this entry counts the
     /// failure again, so none of them is stamped as a completed refresh.
     Failed,
 }
+
+/// One season's `/tv/{id}/season/{n}` lookup, as the scan cached it.
+type SeasonLookup = TmdbLookup<Arc<ferrofin_providers::tmdb::SeasonDetails>>;
+
+/// A series' episode group lookup, as the scan cached it
+/// ([`ArtworkCache::episode_groups`]).
+type GroupLookup = TmdbLookup<Arc<ferrofin_providers::tmdb::EpisodeGroup>>;
+
+/// The key [`ArtworkCache::episode_groups`] keeps a group under: the series
+/// item id (which the scan resolves to one TMDB id), its display order and
+/// the TMDB language, where upstream's is `group-{tmdbId}-{displayOrder}-{language}`.
+type GroupKey = (String, String, Option<String>);
 
 /// The key [`ArtworkCache::season_details`] keeps a season under: the series
 /// item id, the season number and the TMDB language.
@@ -279,7 +299,31 @@ impl SeasonLookup {
             Self::Missing | Self::Failed => 1,
         }
     }
+}
 
+impl GroupLookup {
+    /// `EstimateSize`'s `TvGroupCollection` arm
+    /// ([`EpisodeGroup::estimate_size`](ferrofin_providers::tmdb::EpisodeGroup::estimate_size));
+    /// a miss or a failure weighs one, as a season's does.
+    fn estimate_size(&self) -> u64 {
+        match self {
+            Self::Found(group) => group.estimate_size(),
+            Self::Missing | Self::Failed => 1,
+        }
+    }
+
+    /// The group this lookup found, `Ok(None)` when TMDB has none, `Err`
+    /// when the request failed.
+    fn group(&self) -> Result<Option<Arc<ferrofin_providers::tmdb::EpisodeGroup>>, ()> {
+        match self {
+            Self::Found(group) => Ok(Some(Arc::clone(group))),
+            Self::Missing => Ok(None),
+            Self::Failed => Err(()),
+        }
+    }
+}
+
+impl<T> TmdbLookup<T> {
     /// A failed request counted into the reading item's own refresh (the
     /// scope the original request ran in is the first reader's only).
     fn count_failure(&self) {
@@ -292,8 +336,8 @@ impl SeasonLookup {
 /// TMDB season responses, kept by `TmdbClientManager`'s rules: for
 /// [`TMDB_CACHE_DURATION`], and at most [`TMDB_CACHE_SIZE_LIMIT`] records.
 /// Upstream's one cache holds every TMDB response (series, movies, people,
-/// searches) within that limit; the scan keeps only seasons, so they have
-/// the whole of it.
+/// searches) within that limit; the scan keeps seasons here and episode
+/// groups beside them, each under the whole limit.
 fn tmdb_season_cache() -> ProviderCache<SeasonKey, SeasonLookup> {
     ProviderCache::bounded(
         TMDB_CACHE_DURATION,
@@ -313,6 +357,19 @@ fn tvdb_cache<V>(duration: std::time::Duration) -> ProviderCache<String, V> {
 impl Default for ProviderCache<SeasonKey, SeasonLookup> {
     fn default() -> Self {
         tmdb_season_cache()
+    }
+}
+
+/// TMDB episode groups, kept by `TmdbClientManager`'s rules as the seasons
+/// are ([`tmdb_season_cache`]), with a limit of their own: upstream's one
+/// limit covers both, and a group weighs a few records.
+impl Default for ProviderCache<GroupKey, GroupLookup> {
+    fn default() -> Self {
+        ProviderCache::bounded(
+            TMDB_CACHE_DURATION,
+            TMDB_CACHE_SIZE_LIMIT,
+            GroupLookup::estimate_size,
+        )
     }
 }
 
@@ -700,6 +757,34 @@ fn series_tmdb_id_of(cache: &ArtworkCache, series_id: &str) -> Option<i64> {
                 .ok()
         })
         .or_else(|| recorded_provider_id(cache, series_id, "Tmdb"))
+}
+
+/// [`LibraryScanner::tmdb_episode_image_numbers`] from what the pass has
+/// read: the series' display order (none when it was not read, as for a row
+/// that cannot be) and its group for TheMovieDb's image provider. `None` when
+/// the group is not read yet, or its request failed.
+fn cached_image_numbers(
+    cache: &ArtworkCache,
+    series_id: &str,
+    (season, episode): (i32, i32),
+) -> Option<(i32, i32)> {
+    let order = cache
+        .display_orders
+        .get(series_id)
+        .map_or("", String::as_str);
+    if ferrofin_providers::tmdb::episode_group_type(order).is_none() {
+        return Some((season, episode));
+    }
+    let group = cache
+        .episode_groups
+        .get(&(series_id.to_owned(), order.to_owned(), None))?
+        .group()
+        .ok()?;
+    Some(
+        group
+            .and_then(|group| group.aired_numbers(season, episode))
+            .unwrap_or((season, episode)),
+    )
 }
 
 /// TMDB's `/images` list for one episode: the answer the previous episode's
@@ -7954,8 +8039,10 @@ impl LibraryScanner {
     /// presentation key (its episodes further on take it) — and every lookup
     /// this scan resolved for them is dropped: a series' TMDB and TVDB
     /// match, its seasons' TMDB details (the names, overviews and stills of
-    /// the episodes further on), an episode's TVDB still and an item's OMDb
-    /// poster, so what follows resolves by the ids now stored. The stored
+    /// the episodes further on), its display order and its TMDB episode
+    /// groups (which number those episodes, asked under the old match), an
+    /// episode's TVDB still and an item's OMDb poster, so what follows
+    /// resolves by the ids and order now stored. The stored
     /// rows themselves are read again by the caller, which restarts its
     /// window at the current item, and with them every other item's
     /// provider ids and every item's image probes ([`StoredRows::enter`]).
@@ -7998,6 +8085,10 @@ impl LibraryScanner {
         cache
             .season_details
             .retain(|(series, _, _), _| !keys.contains(series));
+        cache
+            .episode_groups
+            .retain(|(series, _, _), _| !keys.contains(series));
+        cache.display_orders.retain(|id, _| !keys.contains(id));
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
         // An episode request started early was keyed by the ids before it.
         cache.next_episode = None;
@@ -12760,13 +12851,24 @@ impl LibraryScanner {
     /// from one episode request ([`TmdbClient::episode_extras_for_language`]).
     ///
     /// A multi-episode file (the lookup's `IndexNumberEnd`) takes every
-    /// episode of its range the season lists, their names and overviews
-    /// joined ([`ferrofin_providers::episode::tmdb_episode_in_range`],
+    /// episode of its range TMDB has, their names and overviews joined
+    /// ([`ferrofin_providers::episode::TmdbEpisodeLookup`],
     /// `TmdbEpisodeProvider.cs:106-158`), and the first one's own request.
+    ///
+    /// Each episode is looked up in the series' display order
+    /// (`info.SeriesDisplayOrder`, `TmdbEpisodeProvider.cs:115,160`): under
+    /// an order TMDB keeps an episode group for, the aired numbers the
+    /// series' group maps it to ([`episode_group_cached`](Self::episode_group_cached)),
+    /// else its own (`TmdbClientManager.GetEpisodeAsync`, `:286-297`).
     ///
     /// `None` when TMDB has nothing for this episode: no series id to look
     /// it up under, no such season, or no such episode in it (for a range,
-    /// none of its episodes, or an end below its start).
+    /// none of its episodes, or an end below its start). `None` too when a
+    /// request for its group or one of its seasons failed, which TMDbLib
+    /// throws out of `GetEpisodeAsync`, and when the series row cannot be
+    /// read for its order ([`series_display_order`](Self::series_display_order)),
+    /// as TheTVDB's episode lookup skips it: upstream's `Episode.GetLookupInfo`
+    /// has no series ids then, so `TmdbEpisodeProvider` asks nothing.
     async fn fetch_tmdb_episode(
         &self,
         row: &BaseItemEntity,
@@ -12781,34 +12883,58 @@ impl LibraryScanner {
             return None;
         };
         let series_tmdb = lookup_series_tmdb_id(cache, lookup, &series_id)?;
-        let ep = {
-            let details = self
-                .season_details_cached(
-                    cache,
-                    &series_id,
-                    series_tmdb,
-                    season,
-                    lookup.tmdb_language().as_deref(),
-                )
-                .await?;
-            ferrofin_providers::episode::tmdb_episode_in_range(
-                &details,
-                number,
-                lookup.index_number_end,
-            )?
-        };
+        let language = lookup.tmdb_language();
+        // A series row that cannot be read gives no order to look the episode
+        // up in, as for TheTVDB: upstream's lookup has no series ids then.
+        let order = self.series_display_order(cache, &series_id).await?;
+        let group = self
+            .episode_group_cached(cache, &series_id, series_tmdb, &order, language.as_deref())
+            .await
+            .ok()?;
+        let episodes = ferrofin_providers::episode::TmdbEpisodeLookup::new(
+            group.as_deref(),
+            season,
+            (number, lookup.index_number_end),
+        );
+        let (listings, failures) =
+            ferrofin_providers::rate_limit::count_request_failures(Box::pin(async {
+                let mut listings = HashMap::new();
+                for aired in episodes.seasons() {
+                    if let Some(details) = self
+                        .season_details_cached(
+                            cache,
+                            &series_id,
+                            series_tmdb,
+                            aired,
+                            language.as_deref(),
+                        )
+                        .await
+                    {
+                        listings.insert(aired, details);
+                    }
+                }
+                listings
+            }))
+            .await;
+        if failures > 0 {
+            // The scope above hides it from the caller's.
+            ferrofin_providers::rate_limit::note_request_failure();
+            return None;
+        }
+        let (aired_season, ep) = episodes.episode(|aired| listings.get(&aired).map(|d| &**d))?;
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_tmdb_episode(&mut answer.item, &ep);
         // The episode's external ids, trailers and credits, in one request
         // (`TmdbEpisodeProvider` asks `GetEpisodeAsync` with
-        // `credits,images,external_ids,videos` appended).
+        // `credits,images,external_ids,videos` appended), under its aired
+        // numbers.
         let extras = match &self.tmdb {
             Some(tmdb) => {
                 tmdb.episode_extras_for_language(
                     series_tmdb,
-                    season,
+                    aired_season,
                     ep.episode_number,
-                    lookup.tmdb_language().as_deref(),
+                    language.as_deref(),
                 )
                 .await
             }
@@ -15327,14 +15453,14 @@ impl LibraryScanner {
     /// `None` when TMDB is unwired or the request failed — a failure, cached
     /// or fresh, is counted into the caller's `count_request_failures` scope,
     /// so an episode resolved against it is not stamped as refreshed.
-    async fn season_details_cached<'a>(
+    async fn season_details_cached(
         &self,
-        cache: &'a mut ArtworkCache,
+        cache: &mut ArtworkCache,
         series_id: &str,
         tmdb_id: i64,
         season: i32,
         language: Option<&str>,
-    ) -> Option<std::borrow::Cow<'a, ferrofin_providers::tmdb::SeasonDetails>> {
+    ) -> Option<Arc<ferrofin_providers::tmdb::SeasonDetails>> {
         let key = (series_id.to_owned(), season, language.map(str::to_owned));
         // One instant for the check and the read, so an entry that expires
         // between them cannot read as a miss nothing was asked for.
@@ -15346,7 +15472,7 @@ impl LibraryScanner {
             )
             .await;
             let lookup = match details {
-                Some(details) => SeasonLookup::Found(details),
+                Some(details) => SeasonLookup::Found(Arc::new(details)),
                 None if failures > 0 => SeasonLookup::Failed,
                 None => SeasonLookup::Missing,
             };
@@ -15357,7 +15483,7 @@ impl LibraryScanner {
             if let Some(unkept) = cache.season_details.insert(key.clone(), lookup) {
                 unkept.count_failure();
                 return match unkept {
-                    SeasonLookup::Found(details) => Some(std::borrow::Cow::Owned(details)),
+                    SeasonLookup::Found(details) => Some(details),
                     SeasonLookup::Missing | SeasonLookup::Failed => None,
                 };
             }
@@ -15365,9 +15491,91 @@ impl LibraryScanner {
         let lookup = cache.season_details.get_at(&key, now)?;
         lookup.count_failure();
         match lookup {
-            SeasonLookup::Found(details) => Some(std::borrow::Cow::Borrowed(details)),
+            SeasonLookup::Found(details) => Some(Arc::clone(details)),
             SeasonLookup::Missing | SeasonLookup::Failed => None,
         }
+    }
+
+    /// `TmdbClientManager.GetSeriesGroupAsync` for the series `series_id`
+    /// (TMDB id `tmdb_id`): its episode group of display order `order`, in
+    /// `language` ([`TmdbClient::episode_group`]), kept for the pass, at most
+    /// as long as upstream keeps it ([`ArtworkCache::episode_groups`]).
+    ///
+    /// `Ok(None)` when the order names no group type (nothing is asked or
+    /// kept) or TMDB lists no such group. Upstream keeps only a group it
+    /// found, but it keeps the series response it looked in, so neither asks
+    /// again; here the miss is kept. `Err` when a request failed: kept for
+    /// the pass, as a failed season is, and counted once into each reader's
+    /// `count_request_failures` scope.
+    async fn episode_group_cached(
+        &self,
+        cache: &mut ArtworkCache,
+        series_id: &str,
+        tmdb_id: i64,
+        order: &str,
+        language: Option<&str>,
+    ) -> Result<Option<Arc<ferrofin_providers::tmdb::EpisodeGroup>>, ()> {
+        let Some(tmdb) = self
+            .tmdb
+            .as_ref()
+            .filter(|_| ferrofin_providers::tmdb::episode_group_type(order).is_some())
+        else {
+            return Ok(None);
+        };
+        let key = (
+            series_id.to_owned(),
+            order.to_owned(),
+            language.map(str::to_owned),
+        );
+        // One instant for the check and the read, as for a season.
+        let now = std::time::Instant::now();
+        if !cache.episode_groups.contains_key_at(&key, now) {
+            // Its own scope, so each reader, the first included, counts a
+            // failure once ([`TmdbLookup::count_failure`]).
+            let (group, _) = ferrofin_providers::rate_limit::count_request_failures(Box::pin(
+                tmdb.episode_group(tmdb_id, order, language),
+            ))
+            .await;
+            let lookup = match group {
+                Ok(Some(group)) => GroupLookup::Found(Arc::new(group)),
+                Ok(None) => GroupLookup::Missing,
+                Err(_) => GroupLookup::Failed,
+            };
+            // A group the cache has no room for still answers this reader.
+            if let Some(unkept) = cache.episode_groups.insert(key.clone(), lookup) {
+                unkept.count_failure();
+                return unkept.group();
+            }
+        }
+        let lookup = cache.episode_groups.get_at(&key, now).ok_or(())?;
+        lookup.count_failure();
+        lookup.group()
+    }
+
+    /// The aired numbers TheMovieDb's episode image provider asks episode
+    /// `(season, episode)` of series `series_id` (TMDB id `tmdb_id`) for:
+    /// `TmdbEpisodeImageProvider` asks `GetEpisodeAsync` in the series'
+    /// display order with no language (`TmdbEpisodeImageProvider.cs:76`).
+    /// `None` when the group request failed (TMDbLib throws there), or the
+    /// series row cannot be read for its order, as TheTVDB's child images
+    /// skip it (upstream's provider finds no series and asks nothing): the
+    /// provider offers nothing.
+    async fn tmdb_episode_image_numbers(
+        &self,
+        cache: &mut ArtworkCache,
+        (series_id, tmdb_id): (&str, i64),
+        (season, episode): (i32, i32),
+    ) -> Option<(i32, i32)> {
+        let order = self.series_display_order(cache, series_id).await?;
+        let group = self
+            .episode_group_cached(cache, series_id, tmdb_id, &order, None)
+            .await
+            .ok()?;
+        Some(
+            group
+                .and_then(|group| group.aired_numbers(season, episode))
+                .unwrap_or((season, episode)),
+        )
     }
 
     /// The walk's item at `index`, when it is a new episode whose refresh runs
@@ -15439,11 +15647,19 @@ impl LibraryScanner {
         {
             return;
         }
-        let (Some(season), Some(episode), Some(tmdb)) = (
+        let (Some(series_id), Some(season), Some(episode), Some(tmdb)) = (
+            next.series_id.as_deref(),
             next.parent_index_number.and_then(|n| i32::try_from(n).ok()),
             next.index_number.and_then(|n| i32::try_from(n).ok()),
             self.tmdb.clone(),
         ) else {
+            return;
+        };
+        // Its aired numbers, from the order and group this episode's pass
+        // just read (`tmdb_episode_image_numbers`); unknown, it is not
+        // started.
+        let Some((season, episode)) = cached_image_numbers(cache, series_id, (season, episode))
+        else {
             return;
         };
         if fetch != ImageFetch::All
@@ -15510,24 +15726,30 @@ impl LibraryScanner {
             Vec::new()
         };
         let tmdb_images = if policy.image_enabled(short, fetcher_names::TMDB) {
+            let series_id = entity.series_id.as_deref();
             match (
-                entity
-                    .series_id
-                    .as_deref()
-                    .and_then(|series| series_tmdb_id_of(cache, series)),
+                series_id.zip(series_id.and_then(|series| series_tmdb_id_of(cache, series))),
                 entity
                     .parent_index_number
                     .and_then(|n| i32::try_from(n).ok()),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
-                (Some(series), Some(season), Some(episode)) => {
-                    let key = (series, season, episode, language.clone());
-                    let images = episode_images(tmdb, cache, &key).await;
-                    self.prefetch_next_episode_images(entity, &key, cache);
-                    ferrofin_providers::tmdb::ordered_download_images(
-                        images,
-                        language.as_deref().unwrap_or("en"),
-                    )
+                (Some((series_id, series)), Some(season), Some(episode)) => {
+                    match self
+                        .tmdb_episode_image_numbers(cache, (series_id, series), (season, episode))
+                        .await
+                    {
+                        Some((season, episode)) => {
+                            let key = (series, season, episode, language.clone());
+                            let images = episode_images(tmdb, cache, &key).await;
+                            self.prefetch_next_episode_images(entity, &key, cache);
+                            ferrofin_providers::tmdb::ordered_download_images(
+                                images,
+                                language.as_deref().unwrap_or("en"),
+                            )
+                        }
+                        None => Vec::new(),
+                    }
                 }
                 _ => Vec::new(),
             }
@@ -25430,6 +25652,8 @@ mod art_dir_images_tests;
 mod directory_cache_tests;
 #[cfg(test)]
 mod downloaded_art_tests;
+#[cfg(test)]
+mod episode_group_tests;
 #[cfg(test)]
 mod episode_images_tests;
 #[cfg(test)]
@@ -36878,10 +37102,10 @@ mod tests {
         use ferrofin_providers::tmdb::{EpisodeDetails, SeasonDetails};
 
         let season = |records: u64| {
-            SeasonLookup::Found(SeasonDetails {
+            SeasonLookup::Found(Arc::new(SeasonDetails {
                 episodes: vec![EpisodeDetails::default(); usize::try_from(records - 1).unwrap()],
                 ..SeasonDetails::default()
-            })
+            }))
         };
         let key = |number: i32| ("SERIES".to_owned(), number, None);
         assert_eq!(season(20).estimate_size(), 20);

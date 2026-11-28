@@ -381,6 +381,108 @@ pub struct EpisodeDetails {
     pub vote_average: Option<f32>,
 }
 
+/// The TMDb episode group type (TMDbLib's `TvGroupType`) a series'
+/// `DisplayOrder` names, as `TmdbClientManager.GetSeriesGroupAsync` matches it
+/// (`TmdbClientManager.cs:184-192`, compared ordinally): `None` for an order TMDb has no
+/// group for (aired, blank, or one of TheTVDB's own), which is looked up as it
+/// is numbered.
+#[must_use]
+pub fn episode_group_type(display_order: &str) -> Option<u8> {
+    match display_order {
+        "originalAirDate" => Some(1),
+        "absolute" => Some(2),
+        "dvd" => Some(3),
+        "digital" => Some(4),
+        "storyArc" => Some(5),
+        "production" => Some(6),
+        "tv" => Some(7),
+        _ => None,
+    }
+}
+
+/// One of a series' episode groups (`/tv/episode_group/{id}`, TMDbLib's
+/// `TvGroupCollection`): TMDb's seasons of an order other than the aired one,
+/// which `TmdbClientManager.GetEpisodeAsync` maps an episode's numbers through
+/// (`TmdbClientManager.cs:286-297`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct EpisodeGroup {
+    groups: Option<Vec<EpisodeGroupSeason>>,
+}
+
+/// A season of an [`EpisodeGroup`] (TMDbLib's `TvGroup`); its order is 0 when
+/// TMDb leaves it out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EpisodeGroupSeason {
+    #[serde(default)]
+    order: i32,
+    episodes: Option<Vec<EpisodeGroupEpisode>>,
+}
+
+/// An episode of an [`EpisodeGroupSeason`] (TMDbLib's `TvGroupEpisode`): its
+/// place in the group (from 0) and its aired numbers, each 0 when TMDb leaves
+/// it out, as Newtonsoft leaves an `int`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EpisodeGroupEpisode {
+    #[serde(default)]
+    order: i64,
+    #[serde(default)]
+    season_number: i32,
+    #[serde(default)]
+    episode_number: i32,
+}
+
+impl EpisodeGroup {
+    /// The aired season and episode numbers of each episode of season
+    /// `season` in this order numbered in `numbers`, by that number:
+    /// `GetEpisodeAsync` takes the first season whose `Order` is `season`,
+    /// then the first episode whose `Order` is the number less one ("Episode
+    /// order starts at 0"). A number it does not list keeps its own numbers.
+    #[must_use]
+    pub fn aired_numbers_in(
+        &self,
+        season: i32,
+        numbers: std::ops::RangeInclusive<i32>,
+    ) -> std::collections::BTreeMap<i32, (i32, i32)> {
+        let mut aired = std::collections::BTreeMap::new();
+        let episodes = self
+            .groups
+            .iter()
+            .flatten()
+            .find(|group| group.order == season)
+            .and_then(|group| group.episodes.as_deref())
+            .unwrap_or_default();
+        for episode in episodes {
+            if let Some(number) = episode
+                .order
+                .checked_add(1)
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|n| numbers.contains(n))
+            {
+                aired
+                    .entry(number)
+                    .or_insert((episode.season_number, episode.episode_number));
+            }
+        }
+        aired
+    }
+
+    /// [`aired_numbers_in`](Self::aired_numbers_in) for one episode: `None`
+    /// when this order does not list it.
+    #[must_use]
+    pub fn aired_numbers(&self, season: i32, episode: i32) -> Option<(i32, i32)> {
+        self.aired_numbers_in(season, episode..=episode)
+            .remove(&episode)
+    }
+
+    /// What keeping the group weighs under `TmdbClientManager.CacheSizeLimit`:
+    /// `EstimateSize`'s `TvGroupCollection` arm, one plus its seasons
+    /// (`TmdbClientManager.cs:814`).
+    #[must_use]
+    pub fn estimate_size(&self) -> u64 {
+        u64::try_from(1 + self.groups.as_ref().map_or(0, Vec::len)).unwrap_or(u64::MAX)
+    }
+}
+
 /// Full title metadata from `/movie|tv/{id}` (the detail-page fields).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TmdbDetails {
@@ -2361,6 +2463,101 @@ impl TmdbClient {
         })
     }
 
+    /// `TmdbClientManager.GetSeriesGroupAsync` (`TmdbClientManager.cs:182-226`):
+    /// the episode group of series `tmdb_id` in its display order
+    /// `display_order`, the first TMDb lists of the type the order names
+    /// ([`episode_group_type`]), in `language`. An order that names no type
+    /// asks nothing.
+    ///
+    /// Upstream reads the series' groups off its `/tv/{id}` response, which
+    /// `GetSeriesAsync` asks with `episode_groups` appended; this asks
+    /// `/tv/{id}/episode_groups`, the same list, alone.
+    ///
+    /// `Ok(None)` when the order names no type, TMDb lists no group of it, or
+    /// either request is a 404 (TMDbLib's null): the episode keeps its own
+    /// numbers.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`](ferrofin_traits::error::ServiceError) when a request
+    /// failed otherwise or its body did not decode, counted into the caller's
+    /// [`count_request_failures`](crate::rate_limit::count_request_failures)
+    /// scope: TMDbLib throws out of `GetEpisodeAsync` there, so the episode
+    /// gets no answer.
+    pub async fn episode_group(
+        &self,
+        tmdb_id: i64,
+        display_order: &str,
+        language: Option<&str>,
+    ) -> Result<Option<EpisodeGroup>, ferrofin_traits::error::ServiceError> {
+        #[derive(Deserialize)]
+        struct Groups {
+            results: Option<Vec<Listed>>,
+        }
+        #[derive(Deserialize)]
+        struct Listed {
+            id: Option<String>,
+            #[serde(rename = "type")]
+            kind: Option<u8>,
+        }
+        let Some(kind) = episode_group_type(display_order) else {
+            return Ok(None);
+        };
+        let Some(groups) = self
+            .episode_group_get::<Groups>(
+                format!("{}/tv/{tmdb_id}/episode_groups", self.base_url),
+                language,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(id) = groups
+            .results
+            .into_iter()
+            .flatten()
+            .find(|group| group.kind == Some(kind))
+            .and_then(|group| group.id)
+        else {
+            return Ok(None);
+        };
+        // TMDb's own id, kept to one path segment.
+        let mut url = reqwest::Url::parse(&format!("{}/tv/episode_group", self.base_url))
+            .map_err(|_| episode_group_failed())?;
+        url.path_segments_mut()
+            .map_err(|()| episode_group_failed())?
+            .push(&id);
+        self.episode_group_get(url, language).await
+    }
+
+    /// One request of [`episode_group`](Self::episode_group): its body, or
+    /// `None` for a 404.
+    async fn episode_group_get<T: serde::de::DeserializeOwned>(
+        &self,
+        url: impl reqwest::IntoUrl,
+        language: Option<&str>,
+    ) -> Result<Option<T>, ferrofin_traits::error::ServiceError> {
+        let cfg = self.settings().await;
+        let req = self
+            .http
+            .get(url)
+            .query(&[("api_key", cfg.api_key(self.api_key.expose_secret()))]);
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .map_err(|_| episode_group_failed())?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(episode_group_failed());
+        }
+        resp.counted_json()
+            .await
+            .map(Some)
+            .map_err(|_| episode_group_failed())
+    }
+
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
     /// — port of `TmdbClientManager.FindByExternalIdAsync`, which the movie/
     /// series providers use to honour an IMDb/TVDB id already on the item.
@@ -2932,6 +3129,12 @@ fn year_from(date: Option<&str>) -> Option<i32> {
     date?.get(0..4)?.parse().ok()
 }
 
+/// A failed [`TmdbClient::episode_group`] request; the failure itself is
+/// already counted, and its URL carries the API key, so it names neither.
+fn episode_group_failed() -> ferrofin_traits::error::ServiceError {
+    ferrofin_traits::error::ServiceError::backend("TheMovieDb's episode group request failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3084,6 +3287,131 @@ mod tests {
             get_image_language(image_language, image_region, request_language),
             expected,
         );
+    }
+
+    /// `GetSeriesGroupAsync`'s table (`TmdbClientManager.cs:184-192`):
+    /// TMDbLib's `TvGroupType` values, matched ordinally; any other order
+    /// has no group.
+    #[rstest::rstest]
+    #[case("originalAirDate", Some(1))]
+    #[case("absolute", Some(2))]
+    #[case("dvd", Some(3))]
+    #[case("digital", Some(4))]
+    #[case("storyArc", Some(5))]
+    #[case("production", Some(6))]
+    #[case("tv", Some(7))]
+    #[case("Absolute", None)]
+    #[case("aired", None)]
+    #[case("alternate", None)]
+    #[case("", None)]
+    fn a_display_order_names_its_episode_group_type(
+        #[case] order: &str,
+        #[case] expected: Option<u8>,
+    ) {
+        assert_eq!(episode_group_type(order), expected);
+    }
+
+    /// `GetSeriesGroupAsync` takes the first group of the order's type the
+    /// series lists and fetches it in the lookup's language; an order with no
+    /// type asks nothing, and one TMDb lists no group of asks for no group.
+    #[tokio::test]
+    async fn an_episode_group_is_the_first_of_its_type_the_series_lists() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/tv/1399/episode_groups",
+                r#"{"results": [{"id": "dvd1", "type": 3}, {"id": "abs1", "type": 2},
+                    {"id": "abs2", "type": 2}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/tv/episode_group/abs1",
+                r#"{"groups": [{"order": 1, "episodes": [
+                    {"order": 4, "season_number": 2, "episode_number": 1}]}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let group = client
+            .episode_group(1399, "absolute", Some("de-DE"))
+            .await
+            .expect("answered")
+            .expect("a group");
+        assert_eq!(group.aired_numbers(1, 5), Some((2, 1)));
+        assert_eq!(group.estimate_size(), 2);
+        assert_eq!(
+            server.query_values("/tv/episode_group/abs1", "language"),
+            ["de-DE"]
+        );
+        assert_eq!(
+            server.query_values("/tv/episode_group/abs2", "api_key"),
+            Vec::<String>::new(),
+            "only the first group of the type is asked"
+        );
+        assert_eq!(
+            client
+                .episode_group(1399, "storyArc", None)
+                .await
+                .expect("answered"),
+            None,
+            "no story-arc group"
+        );
+        assert_eq!(
+            client
+                .episode_group(1399, "aired", None)
+                .await
+                .expect("answered"),
+            None
+        );
+        assert_eq!(
+            server
+                .query_values("/tv/1399/episode_groups", "api_key")
+                .len(),
+            2,
+            "the aired order asks nothing"
+        );
+    }
+
+    /// A 404 for the list or the group is TMDbLib's null: no group, no
+    /// failure. Any other failed request fails the lookup and is counted:
+    /// TMDbLib throws out of `GetEpisodeAsync`.
+    #[rstest::rstest]
+    #[case::no_list(vec![crate::mock_http::MockServer::raw_status("404 Not Found")], false, 0)]
+    #[case::no_group(
+        vec![
+            json_ok(r#"{"results": [{"id": "abs1", "type": 2}]}"#),
+            crate::mock_http::MockServer::raw_status("404 Not Found"),
+        ],
+        false,
+        0
+    )]
+    #[case::refused(vec![crate::mock_http::MockServer::raw_status("401 Unauthorized")], true, 1)]
+    #[case::undecodable(
+        vec![
+            json_ok(r#"{"results": [{"id": "abs1", "type": 2}]}"#),
+            json_ok(r#"{"groups": "not a list"}"#),
+        ],
+        true,
+        1
+    )]
+    #[tokio::test]
+    async fn a_missing_group_is_none_and_a_failed_request_an_error(
+        #[case] responses: Vec<Vec<u8>>,
+        #[case] fails: bool,
+        #[case] failures: u32,
+    ) {
+        let server = crate::mock_http::MockServer::start_raw(responses).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (group, counted) =
+            crate::rate_limit::count_request_failures(client.episode_group(1399, "absolute", None))
+                .await;
+        if fails {
+            assert!(group.is_err());
+        } else {
+            assert_eq!(group.expect("answered"), None);
+        }
+        assert_eq!(counted, failures);
     }
 
     /// A `200` whose body does not decode is a provider failure, not a

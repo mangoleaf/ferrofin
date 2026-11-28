@@ -2972,18 +2972,41 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
                    manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
                    is not asked, as TmdbEpisodeProvider returns nothing for \
-                   IsMissingEpisode). Both read a multi-episode file's IndexNumberEnd range \
-                   through episode.rs tmdb_episode_in_range; the scan's lookup has its stored \
+                   IsMissingEpisode). Both look an episode up in its series' display order \
+                   (EpisodeInfo.SeriesDisplayOrder) through tmdb.rs episode_group_type and \
+                   episode_group (GetSeriesGroupAsync: the order's TvGroupType compared \
+                   ordinally, the first group of that type the series lists, from \
+                   /tv/{id}/episode_groups where upstream reads the list GetSeriesAsync \
+                   appends, then /tv/episode_group/{id} in the lookup's language; a 404 is no \
+                   group, any other failure no answer, as TMDbLib throws out of \
+                   GetEpisodeAsync) and episode.rs TmdbEpisodeLookup with \
+                   EpisodeGroup::aired_numbers_in (GetEpisodeAsync's mapping, per number of a \
+                   multi-episode file's IndexNumberEnd range: the first group whose Order is \
+                   the season, its first episode whose Order is the number less one, a \
+                   number it does not list kept as numbered; a failed season request no \
+                   answer), and the episode's own request under the first one's aired \
+                   numbers; the scan keeps each group, and a series' miss or failed request, \
+                   for the pass and at most TmdbClientManager's hour, by series, order and \
+                   language (library_scan.rs episode_group_cached). In the scan, an episode \
+                   whose series row cannot be read is not looked up, as for TheTVDB: \
+                   upstream's lookup has no series ids then. The scan's lookup has its stored \
                    row's range end, else its file name's (under Replace all metadata the file \
-                   name's first), never its NFO's (MergeNewData passes ids only). Compared \
+                   name's first), never its NFO's (MergeNewData passes ids only). The same \
+                   mapping serves TheMovieDb's episode image provider in the scan's image \
+                   pass (fetch_tv_still_images, tmdb_episode_image_numbers, \
+                   cached_image_numbers for the next episode's early request) and in \
+                   provider_manager.rs tmdb_images, with no language \
+                   (TmdbEpisodeImageProvider.cs:76). Compared \
                    with TmdbMovieProvider, TmdbSeriesProvider (MapTvShowToSeries), \
                    TmdbSeasonProvider and TmdbEpisodeProvider \
-                   GetMetadata, TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
+                   GetMetadata, TmdbEpisodeImageProvider's GetEpisodeAsync call, \
+                   TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
                    TheMovieDb's box-set, person, missing-episode and similar-items providers \
-                   and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
-                   TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
-                   this row.",
-        date: "2026-11-26",
+                   and its image providers' other candidates (which images, their ranking \
+                   and sizes), the other providers (TheTVDB, OMDb, \
+                   MusicBrainz, TheAudioDB; gl-1815) and the merge onto the item (gl-1813) \
+                   are not part of this row.",
+        date: "2026-11-27",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
@@ -2996,9 +3019,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
-            "An episode is looked up in aired order whatever the series' display order; \
-             upstream maps an absolute, DVD, digital, story-arc, production, TV or \
-             original-air-date order through TMDb's episode group. Fix path: gl-1784.",
+            "TheMovieDb's responses are kept only within one scan pass (its seasons and the \
+             series' episode groups), where upstream's TmdbClientManager keeps every response \
+             for an hour across the process: an episode refresh outside the scan (one with \
+             a remote path or outside every library), GET /Items/{itemId}/RemoteImages and a \
+             scan within the hour of another ask TMDb again. Fix path: gl-2034.",
             "An episode with no season number is not looked up; upstream looks it up in \
              season 1 (TmdbEpisodeProvider.cs:99), with its resolver's season-1 default for \
              a loose episode, which Ferrofin's planner lacks too. Fix path: gl-1846.",
@@ -3784,9 +3809,6 @@ const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
      parts (fil, zh-Hans-CN, set through the API) an image whose code is the tag's first two \
      letters is labelled with the tag and ranked first; v12.4 has no such step. Fix path: \
      gl-1716.",
-    "An episode's TheMovieDb stills are those of its aired-order numbers, where \
-     TmdbEpisodeImageProvider passes the series' DisplayOrder, mapped through TMDb's episode \
-     group. Fix path: gl-1784.",
     "TheAudioDB's artist artwork needs the artist's MusicBrainz id, where \
      AudioDbArtistImageProvider falls back to its TheAudioDB id (artist.php). Fix path: \
      gl-497.",
@@ -8155,7 +8177,10 @@ pub const VERIFIED: &[Verified] = &[
                person_images (TmdbMovieImageProvider, Order 0, a Tmdb id else an Imdb id \
                through /find; TmdbSeriesImageProvider, 2; TmdbSeasonImageProvider and \
                TmdbEpisodeImageProvider, 1, by the series' Tmdb id and the season and \
-               episode numbers, an episode with no season number in season 1; \
+               episode numbers, an episode with no season number in season 1, an episode's \
+               numbers mapped through the series' episode group of its DisplayOrder, asked \
+               with no language as GetEpisodeAsync asks it, tmdb.rs episode_group (the \
+               metadata-providers row), a failed group request offering nothing; \
                TmdbBoxSetImageProvider and TmdbPersonImageProvider, 0; \
                ConvertToRemoteImageInfo: the size setting per family, the ThumbnailSizes \
                preview, the dimensions only at the original size, vote average and count, \
@@ -8180,7 +8205,7 @@ pub const VERIFIED: &[Verified] = &[
                StudiosImageProvider through studios.rs, GetComparableName against the \
                repository's thumbs.txt, kept a day). Compared at the pinned v12.4 tag, and \
                live on 12.4 with Fanart 15.0.0.0 installed",
-        date: "2026-11-26",
+        date: "2026-11-27",
         divergences: REMOTE_IMAGES_DIVERGENCES,
         refs: &[],
     },
