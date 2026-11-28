@@ -10,8 +10,9 @@ FROM rust:1.100.0-trixie
 # FERROFIN_WASM_GUEST_TESTS=1 end-to-end test — the WIT contract anchor).
 RUN rustup component add rustfmt clippy llvm-tools-preview  && rustup target add wasm32-wasip2
 
-# cmake and nasm build the libjpeg-turbo that turbojpeg-sys vendors (nasm assembles its
-# x86-64 SIMD; require-simd fails the build without it). Same packages as the root Dockerfile.
+# cmake and nasm build libjpeg-turbo, which the lint and coverage jobs do with
+# scripts/libjpeg-turbo.sh before they compile (nasm assembles its x86-64 SIMD; the script fails
+# the build without it). Same packages as the root Dockerfile.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake nasm \
  && rm -rf /var/lib/apt/lists/*

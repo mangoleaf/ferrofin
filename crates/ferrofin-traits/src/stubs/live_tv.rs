@@ -446,9 +446,10 @@ pub trait LiveTvManager: Send + Sync {
     ///
     /// Port of `GuideManager.RefreshGuide`, i.e. the body of upstream's
     /// `RefreshGuideScheduledTask`. It is the TASK's work: a configuration write
-    /// queues it and returns (`handlers::live_tv::queue_guide_refresh`) rather
-    /// than awaiting it, because the fetches are third-party network I/O and an
-    /// admin request must not hang on them.
+    /// queues the task and returns (`handlers::live_tv::queue_guide_refresh`)
+    /// rather than awaiting it, because the fetches are third-party network I/O
+    /// and an admin request must not hang on them. The task itself calls
+    /// [`refresh_guide_until`](Self::refresh_guide_until).
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
 
     /// [`refresh_guide`](Self::refresh_guide) for the "Refresh Guide" task,

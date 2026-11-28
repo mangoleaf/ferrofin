@@ -1577,7 +1577,6 @@ dependencies = [
  "ferrofin-util",
  "flate2",
  "image",
- "jpeg-decoder",
  "jpeg-encoder",
  "kamadak-exif",
  "quick-xml",
@@ -3103,12 +3102,6 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
-
-[[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
 
 [[package]]
 name = "jpeg-encoder"
@@ -6070,7 +6063,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49b5a974bc59382d35927e3a07eef2ba9a24fe7227cefe52ec44b508e1b90f86"
 dependencies = [
  "anyhow",
- "cmake",
  "libc",
 ]
 

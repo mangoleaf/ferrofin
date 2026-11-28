@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
+#[path = "support/guide_refresh.rs"]
+mod guide_refresh;
+
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASSWORD: &str = "live-tv-artwork-admin-pw";
 /// What the local image files hold.
@@ -44,8 +47,6 @@ const THUMB: i32 = 5;
 const PRIMARY: i32 = 0;
 /// `BaseItemImageInfos.ImageType` of a Backdrop image.
 const BACKDROP: i32 = 2;
-/// How long a lineup may take to appear after its tuner is saved.
-const LINEUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A booted server and an admin session.
 struct Fixture {
@@ -107,8 +108,8 @@ async fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// Configures the playlist `m3u` and the guide `xmltv` and refreshes the
-    /// guide, through the routes the dashboard uses and the task's own call.
+    /// Configures the playlist `m3u` and the guide `xmltv` through the routes
+    /// the dashboard uses, and waits for the guide refresh they queue.
     async fn refresh_guide(&self, m3u: &str, xmltv: &str) {
         let playlist = self.temp.path().join("playlist.m3u");
         let guide = self.temp.path().join("guide.xml");
@@ -122,6 +123,7 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body:?}");
+        let since = chrono::Utc::now();
         let (status, body) = self
             .admin(
                 "POST",
@@ -134,22 +136,10 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body:?}");
-        // Each save queued a refresh, and a later refresh supersedes an earlier
-        // one's write. Once a lineup is listed they have all started, so the
-        // refresh below is the newest and has finished when it returns.
-        let deadline = std::time::Instant::now() + LINEUP_DEADLINE;
-        while self.listed("/LiveTv/Channels").await.is_empty() {
-            assert!(std::time::Instant::now() < deadline, "no lineup appeared");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        self.wired
-            .state
-            .live_tv
-            .as_ref()
-            .expect("live tv is wired")
-            .refresh_guide()
-            .await
-            .expect("guide refresh");
+        // Each save queued the "Refresh Guide" task, and the second stopped the
+        // first's run: the guide is whole once the run that started after it has
+        // completed.
+        guide_refresh::guide_refreshed_since(self.wired.state.tasks.as_ref(), since).await;
     }
 
     async fn admin(&self, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Bytes) {

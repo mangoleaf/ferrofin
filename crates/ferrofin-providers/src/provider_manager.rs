@@ -2635,7 +2635,7 @@ impl LocalProviderManager {
         for name in sources {
             let answer = if name == fetcher_names::TMDB {
                 self.tmdb_episode(
-                    series_id_of("Tmdb"),
+                    (row, series_id_of("Tmdb")),
                     season_number,
                     (episode_number, crate::episode::lookup_range_end(row)),
                     tmdb_language.as_deref(),
@@ -2764,22 +2764,52 @@ impl LocalProviderManager {
 
     /// `TmdbEpisodeProvider`'s answer: the episode's entry in the series'
     /// season response — for a multi-episode one (`episode_end`), every entry
-    /// up to its end, joined ([`crate::episode::tmdb_episode_in_range`]) — and
-    /// the first one's own request, by the series' `Tmdb` id only.
+    /// up to its end, joined ([`crate::episode::TmdbEpisodeLookup`]) — and
+    /// the first one's own request, by the series' `Tmdb` id only, in the
+    /// display order of `row`'s series (`info.SeriesDisplayOrder`): under an order
+    /// TMDb keeps an episode group for, the aired numbers the group maps the
+    /// episode to ([`TmdbClient::episode_group`]). No answer when a request
+    /// for the group or one of its seasons failed, which TMDbLib throws out
+    /// of `GetEpisodeAsync`.
     async fn tmdb_episode(
         &self,
-        series_tmdb_id: Option<i64>,
+        (row, series_tmdb_id): (&BaseItemEntity, Option<i64>),
         season_number: i32,
         (episode_number, episode_end): (i32, Option<i32>),
         language: Option<&str>,
     ) -> Option<crate::episode::EpisodeAnswer> {
         let (client, series) = self.tmdb.as_ref().zip(series_tmdb_id)?;
-        let season = client
-            .season_details_for_language(series, season_number, language)
-            .await?;
-        let entry = crate::episode::tmdb_episode_in_range(&season, episode_number, episode_end)?;
+        let display_order = self.series_display_order_of(row).await;
+        let group = client
+            .episode_group(series, &display_order, language)
+            .await
+            .ok()?;
+        let lookup = crate::episode::TmdbEpisodeLookup::new(
+            group.as_ref(),
+            season_number,
+            (episode_number, episode_end),
+        );
+        let (listings, failures) = crate::rate_limit::count_request_failures(async {
+            let mut listings = HashMap::new();
+            for aired in lookup.seasons() {
+                if let Some(details) = client
+                    .season_details_for_language(series, aired, language)
+                    .await
+                {
+                    listings.insert(aired, details);
+                }
+            }
+            listings
+        })
+        .await;
+        if failures > 0 {
+            // The scope above hides it from the caller's.
+            crate::rate_limit::note_request_failure();
+            return None;
+        }
+        let (aired_season, entry) = lookup.episode(|aired| listings.get(&aired))?;
         let extras = client
-            .episode_extras_for_language(series, season_number, entry.episode_number, language)
+            .episode_extras_for_language(series, aired_season, entry.episode_number, language)
             .await;
         Some(crate::episode::tmdb_answer(
             &entry,
@@ -5029,6 +5059,16 @@ impl LocalProviderManager {
                     let Some(episode_number) = number(entity.index_number) else {
                         return Vec::new();
                     };
+                    // `GetEpisodeAsync` in the series' display order, with no
+                    // language (`TmdbEpisodeImageProvider.cs:76`); a failed
+                    // group request offers nothing.
+                    let order = crate::tvdb::display_order_of(series.data.as_deref());
+                    let Ok(group) = tmdb.episode_group(series_tmdb_id, &order, None).await else {
+                        return Vec::new();
+                    };
+                    let (season_number, episode_number) = group
+                        .and_then(|group| group.aired_numbers(season_number, episode_number))
+                        .unwrap_or((season_number, episode_number));
                     tmdb.episode_images(
                         series_tmdb_id,
                         season_number,
@@ -10335,6 +10375,74 @@ mod tests {
                 ImageType::Primary
             )],
             "stills map to Primary, like ConvertStillsToRemoteImageInfo"
+        );
+    }
+
+    /// `TmdbEpisodeImageProvider` asks `GetEpisodeAsync` in the series'
+    /// display order with no language (gl-1784): an episode of a DVD-ordered
+    /// series is offered the stills of the aired episode its group maps it to,
+    /// here S01E02 to aired S03E07.
+    #[tokio::test]
+    async fn an_episode_offers_the_stills_of_its_aired_numbers_in_its_order() {
+        let tmdb_server = crate::mock_http::MockServer::start(vec![
+            (
+                "/tv/1399/episode_groups",
+                r#"{"results": [{"id": "dvd1", "type": 3}]}"#.to_owned(),
+            ),
+            (
+                "/tv/episode_group/dvd1",
+                r#"{"groups": [{"order": 1, "episodes": [
+                    {"order": 1, "season_number": 3, "episode_number": 7}]}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/season/3/episode/7/images",
+                r#"{"stills":[{"file_path":"/dvd-still.jpg"}]}"#.to_owned(),
+            ),
+            (
+                "/season/1/episode/2/images",
+                r#"{"stills":[{"file_path":"/aired-still.jpg"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&tmdb_server.base_url));
+        let series_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Parity Show");
+        series.id = series_id.to_string();
+        series.data = Some(r#"{"DisplayOrder":"dvd"}"#.to_owned());
+        let episode_id = Uuid::new_v4();
+        let mut episode = row("TV.Episode", "Ep 2");
+        episode.id = episode_id.to_string();
+        episode.series_id = Some(series_id.to_string());
+        episode.parent_index_number = Some(1);
+        episode.index_number = Some(2);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(series_id, series), (episode_id, episode)]),
+            seen: tx,
+        });
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .insert(series_id, vec![("Tmdb".to_owned(), "1399".to_owned())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(tmdb, items)
+            .with_image_store(store, std::env::temp_dir());
+
+        let images = mgr
+            .get_available_remote_images(episode_id, &RemoteImageQuery::default())
+            .await
+            .expect("episode images");
+        assert_eq!(
+            images.iter().map(|i| i.url.as_deref()).collect::<Vec<_>>(),
+            [Some("https://image.tmdb.org/t/p/original/dvd-still.jpg")]
+        );
+        assert_eq!(
+            tmdb_server.query_values("/tv/episode_group/dvd1", "language"),
+            Vec::<String>::new(),
+            "no language, as the image provider passes none"
         );
     }
 
@@ -15874,6 +15982,16 @@ mod tests {
                     ("/tmdb/tv/1399/season/1/episode/2", TMDB_EPISODE),
                     ("/tmdb/tv/1399/season/1", TMDB_EPISODE_SEASON),
                     (
+                        "/tmdb/tv/1399/episode_groups",
+                        r#"{"results": [{"id": "dvd1", "type": 3}]}"#,
+                    ),
+                    // On DVD, season 1's second episode is aired S01E03.
+                    (
+                        "/tmdb/tv/episode_group/dvd1",
+                        r#"{"groups": [{"order": 1, "episodes": [
+                            {"order": 1, "season_number": 1, "episode_number": 3}]}]}"#,
+                    ),
+                    (
                         "/omdb/",
                         r#"{"Episodes": [{"Title": "OMDb Episode", "Episode": "2",
                             "imdbID": "tt0002002", "Plot": "OMDb plot.", "imdbRating": "7.7"}]}"#,
@@ -15914,10 +16032,22 @@ mod tests {
             options: ferrofin_model::configuration::LibraryOptions,
             stored: impl FnOnce(&mut BaseItemEntity),
         ) -> Self {
+            Self::with_series(base, series_ids, options, None, stored)
+        }
+
+        /// [`new`](Self::new) under a series whose `Data` is `series_data`.
+        fn with_series(
+            base: &str,
+            series_ids: &[(&str, &str)],
+            options: ferrofin_model::configuration::LibraryOptions,
+            series_data: Option<&str>,
+            stored: impl FnOnce(&mut BaseItemEntity),
+        ) -> Self {
             let library_id = Uuid::new_v4();
             let series_id = Uuid::new_v4();
             let mut series = row("TV.Series", "Show");
             series.id = series_id.to_string();
+            series.data = series_data.map(str::to_owned);
             let episode_id = Uuid::new_v4();
             let mut episode = row("TV.Episode", "Stored");
             // A fill-only refresh keeps a stored title; a new episode has none.
@@ -16226,6 +16356,44 @@ mod tests {
             "{asked:?}"
         );
         assert!(!asked.iter().any(|l| l.contains("/episode/3")), "{asked:?}");
+    }
+
+    /// `info.SeriesDisplayOrder` (gl-1784): an episode of a DVD-ordered series
+    /// is TheMovieDb's aired episode the series' DVD group maps it to, here
+    /// S01E02 to aired S01E03, its text and its own request; the aired S01E02
+    /// is never asked. The group is asked in the episode's language.
+    #[tokio::test]
+    async fn a_dvd_ordered_episode_takes_tmdbs_episode_its_group_maps_it_to() {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::with_series(
+            &base,
+            &[("Tmdb", "1399")],
+            episode_fetchers(&[crate::library_options::fetcher_names::TMDB]),
+            Some(r#"{"DisplayOrder":"dvd"}"#),
+            remote,
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some("TMDB Third"));
+        assert_eq!(row.index_number, Some(2), "its own number stays");
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tmdb/tv/1399/season/1/episode/3?")),
+            "{asked:?}"
+        );
+        assert!(!asked.iter().any(|l| l.contains("/episode/2")), "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tmdb/tv/episode_group/dvd1?") && l.contains("language=en")),
+            "{asked:?}"
+        );
     }
 
     /// A series' Identify result: its TheMovieDb id and an id no season or

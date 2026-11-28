@@ -458,6 +458,115 @@ async fn convert_text_subtitle_passes_charenc_for_a_seven_bit_escape_encoding(
     );
 }
 
+// ---- What .NET's code pages hold that encoding_rs lacks (gl-2000) ------------
+//
+// Jellyfin decodes Korean text with .NET's code page 949, alone (`cp949`) or
+// under ISO-2022-KR (code page 50225). Its rows C9 and FE are the Private Use
+// Area from U+E000, 94 to a row, which WHATWG's EUC-KR index leaves out.
+// Measured on Jellyfin 12.4: a sidecar holding every pair of both rows is
+// served as U+E000 to U+E0BB, in both forms.
+
+/// Enough Korean that chardetng keeps EUC-KR beside two user-defined pairs,
+/// which it counts against the charset.
+const KOREAN_TEXT: &str = "이 영화는 정말 재미있습니다. 우리는 내일 다시 만날 것입니다. 그는 집에 가고 싶어 합니다. 안녕하세요, 만나서 반갑습니다.";
+
+#[tokio::test]
+async fn get_subtitle_stream_reads_the_user_defined_rows_of_code_page_949() {
+    let text = KOREAN_TEXT.repeat(4);
+    let (korean, _, _) = encoding_rs::EUC_KR.encode(&text);
+    // C9A1 and FEFE, the first and the last user-defined cell.
+    let uhc = [
+        b"1\n00:00:01,000 --> 00:00:02,500\n",
+        &korean[..],
+        b" \xc9\xa1 \xfe\xfe\n\n",
+    ]
+    .concat();
+    let iso_2022_kr =
+        b"1\n00:00:01,000 --> 00:00:02,500\n\x1b$)C\x0eGQ19>n\x0f \x0eI!\x0f \x0e~~\x0f\n\n"
+            .to_vec();
+
+    for (bytes, cue) in [(uhc, text.as_str()), (iso_2022_kr, "한국어")] {
+        let (encoder, file_info) = encoder_for_srt("/media/korean.srt", bytes);
+
+        let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+        assert_eq!(
+            String::from_utf8(stream.into_bytes()).unwrap(),
+            format!("1\n00:00:01,000 --> 00:00:02,500\n{cue} \u{E000} \u{E0BB}\n\n")
+        );
+    }
+}
+
+// Jellyfin reads 8-bit Simplified Chinese as `gb18030`, and .NET's GB18030
+// decodes the four-byte sequence 81 35 F4 37 to U+1E3F, where WHATWG's index
+// has U+E7C7. Measured on Jellyfin 12.4 (gl-2000).
+#[tokio::test]
+async fn get_subtitle_stream_reads_the_four_byte_m_acute_of_gb18030() {
+    let text = "这是中文字幕。我们明天再见。";
+    let (chinese, _, _) = encoding_rs::GBK.encode(text);
+    let srt = [
+        b"1\n00:00:01,000 --> 00:00:02,500\n",
+        &chinese[..],
+        b" \x81\x35\xf4\x37\n\n",
+    ]
+    .concat();
+    let (encoder, file_info) = encoder_for_srt("/media/chinese.srt", srt);
+
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(stream.into_bytes()).unwrap(),
+        format!("1\n00:00:01,000 --> 00:00:02,500\n{text} \u{1E3F}\n\n")
+    );
+}
+
+// Bytes with no character in their charset are what .NET's decoders write
+// for them, as Jellyfin 12.4 serves them (gl-2010): `?`, U+30FB in the
+// Japanese code pages, and a code point of its own for a lone byte. Each
+// sequence is one chardetng keeps the charset beside, at a price the text
+// before it has to outweigh.
+#[rstest::rstest]
+#[case::cp949(encoding_rs::EUC_KR, KOREAN_TEXT, b" \x80 \xff", " \u{80} \u{F8F7}")]
+#[case::gb18030(encoding_rs::GBK, "这是中文字幕。我们明天再见。", b" \xff", " ?")]
+#[case::big5(encoding_rs::BIG5, "這是中文字幕。我們明天再見。", b" \xa3\xe2", " ?")]
+#[case::shift_jis(
+    encoding_rs::SHIFT_JIS,
+    "これは日本語の字幕です。あなたはどこにいますか。",
+    b" \x81\xad \xa0",
+    " \u{30FB} \u{F8F0}"
+)]
+#[case::euc_jp(
+    encoding_rs::EUC_JP,
+    "これは日本語の字幕です。あなたはどこにいますか。",
+    b" \xa9\xa1",
+    " \u{30FB}"
+)]
+#[tokio::test]
+async fn get_subtitle_stream_reads_bytes_with_no_character_as_dotnet_does(
+    #[case] encoding: &'static encoding_rs::Encoding,
+    #[case] text: &str,
+    #[case] bytes: &[u8],
+    #[case] expected: &str,
+) {
+    let text = text.repeat(40);
+    let (encoded, _, _) = encoding.encode(&text);
+    let srt = [
+        b"1\n00:00:01,000 --> 00:00:02,500\n",
+        &encoded[..],
+        bytes,
+        b"\n\n",
+    ]
+    .concat();
+    let (encoder, file_info) = encoder_for_srt("/media/legacy.srt", srt);
+
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(stream.into_bytes()).unwrap(),
+        format!("1\n00:00:01,000 --> 00:00:02,500\n{text}{expected}\n\n")
+    );
+}
+
 // ---- ConvertTextSubtitleToSrt charset hint ----------------------------------
 //
 // Port of the C# arg construction: `-y{charenc} -i "{in}" -c:s srt "{out}"`.

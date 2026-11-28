@@ -861,7 +861,7 @@ async fn add_tuner_host(
 ) -> Result<Json<TunerHostInfo>, ApiError> {
     let m = live_tv(&state)?;
     let saved = m.save_tuner_host(info).await?;
-    queue_guide_refresh(m);
+    queue_guide_refresh(&state).await;
     Ok(Json(saved))
 }
 
@@ -880,7 +880,7 @@ async fn delete_tuner_host(
 ) -> Result<axum::http::StatusCode, ApiError> {
     let m = live_tv(&state)?;
     m.delete_tuner_host(&q.id).await?;
-    queue_guide_refresh(m);
+    queue_guide_refresh(&state).await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -920,7 +920,7 @@ async fn add_listing_provider(
     let saved = m
         .save_listing_provider(info, query.validate_login, query.validate_listings)
         .await?;
-    queue_guide_refresh(m);
+    queue_guide_refresh(&state).await;
     Ok(Json(saved))
 }
 
@@ -938,7 +938,7 @@ async fn delete_listing_provider(
     // `RefreshGuideScheduledTask`, whose `CleanDatabase` pass is what actually
     // drains the listings the removed provider supplied — queued, so the DELETE
     // answers 204 before the guide has drained, on both servers.
-    queue_guide_refresh(m);
+    queue_guide_refresh(&state).await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -962,34 +962,31 @@ async fn reset_tuner(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Queues a guide refresh and returns immediately.
+/// The key of the "Refresh Guide" task (`RefreshGuideScheduledTask.Key`).
+const REFRESH_GUIDE_TASK_KEY: &str = "RefreshGuide";
+
+/// Queues the "Refresh Guide" task and returns.
 ///
 /// Port of `_taskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`,
-/// which every Live TV configuration write ends with: upstream the rebuild is
-/// the scheduled task's work, never the request's, so `POST /LiveTv/TunerHosts`
-/// and friends answer as soon as the configuration is saved. Awaiting the
-/// rebuild inline instead would hold an admin request open across a third-party
-/// M3U/XMLTV fetch, and (behind the manager's guide lock) hold every other Live
-/// TV configuration write behind it.
+/// which every Live TV configuration write ends with: a running refresh is
+/// asked to stop, and one new run starts when it has ended (at once, when the
+/// task is idle). So the run that ends last started after the last write, and
+/// reads the configuration that write stored. The rebuild is the task's work,
+/// never the request's: the dashboard shows it Running with its progress and
+/// can stop it, and the request does not wait on a tuner or a guide source.
 ///
-/// Upstream CANCELS an in-flight refresh and starts over. Here the new pass
-/// supersedes the older one: the older pass stops asking Schedules Direct for
-/// stations and does not write, and the write halves are serialized by the
-/// manager's guide lock. The end state is the same — the last pass rewrites the
-/// guide from the current configuration — and the fetch half runs outside that
-/// lock, so a wedged source cannot stall the queue indefinitely. A superseded
-/// pass that is mid-fetch on a slow tuner or XMLTV source still finishes that
-/// fetch before it notices.
-fn queue_guide_refresh(manager: &std::sync::Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
-    let manager = std::sync::Arc::clone(manager);
-    tokio::spawn(tracing::Instrument::instrument(
-        async move {
-            if let Err(error) = manager.refresh_guide().await {
-                tracing::warn!(%error, "live tv: queued guide refresh failed");
-            }
-        },
-        tracing::info_span!(parent: None, "guide_refresh", trigger = "api"),
-    ));
+/// Upstream's call cannot fail. A registry that refuses here (it is shutting
+/// down, or a run-now request took the task in the same instant) is logged,
+/// and the write, which is stored, still answers.
+async fn queue_guide_refresh(state: &AppState) {
+    let task_id = ferrofin_traits::tasks::task_id_for_key(REFRESH_GUIDE_TASK_KEY);
+    if let Err(error) = state.tasks.cancel_if_running_and_queue(&task_id).await {
+        tracing::warn!(
+            task = REFRESH_GUIDE_TASK_KEY,
+            %error,
+            "live tv: could not queue the guide refresh"
+        );
+    }
 }
 
 /// Returns the wired Live TV manager, or `501` when Live TV is not configured in
@@ -1692,7 +1689,7 @@ async fn set_channel_mapping(
     // and upstream leaves that to the queued task (ListingsManager.cs:272),
     // queued before its `.First(...)` throws for a tuner channel not in the
     // lineup (a 500 there, the 404 here).
-    queue_guide_refresh(m);
+    queue_guide_refresh(&state).await;
     let mapping = mapping.ok_or_else(|| {
         ServiceError::not_found(format!("tuner channel {}", dto.tuner_channel_id))
     })?;
@@ -2867,17 +2864,9 @@ mod tests {
         /// assertion target for the pass-through, so the handler is proven to
         /// forward the DTO rather than reinterpret it.
         mapping_args: std::sync::Mutex<Option<(String, String, String)>>,
-        /// How many guide refreshes the handlers queued.
-        refreshes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        /// Fired as a queued refresh starts, so a test can wait for the
-        /// spawned task rather than sleep for it.
-        refresh_started: std::sync::Arc<tokio::sync::Notify>,
-        /// When set, a queued refresh NEVER returns — the shape of a wedged
-        /// M3U/XMLTV source. A handler that awaited the refresh instead of
-        /// queuing it could not answer at all.
-        hang_refresh: bool,
-        /// The span each refresh ran in, by name.
-        refresh_spans: std::sync::Mutex<Vec<Option<&'static str>>>,
+        /// How many guide refreshes the handlers ran themselves: none, the
+        /// refresh is the task's work.
+        refreshes: std::sync::atomic::AtomicUsize,
         /// The tuner-host types the manager reports, so a test can prove the
         /// handler *projects the manager's list* rather than a literal.
         tuner_host_types: Vec<NameIdPair>,
@@ -3016,9 +3005,9 @@ mod tests {
         }
         async fn save_tuner_host(
             &self,
-            _info: TunerHostInfo,
+            info: TunerHostInfo,
         ) -> Result<TunerHostInfo, ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            Ok(info)
         }
         fn tuner_host_types(&self) -> Vec<NameIdPair> {
             self.tuner_host_types.clone()
@@ -3042,7 +3031,7 @@ mod tests {
             &self,
             _id: &str,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            Ok(())
         }
         async fn get_channels(
             &self,
@@ -3084,15 +3073,6 @@ mod tests {
         async fn refresh_guide(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
             self.refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.refresh_spans.lock().unwrap().push(
-                tracing::Span::current()
-                    .metadata()
-                    .map(tracing::Metadata::name),
-            );
-            self.refresh_started.notify_one();
-            if self.hang_refresh {
-                std::future::pending::<()>().await;
-            }
             Ok(())
         }
         async fn get_timers(
@@ -3179,7 +3159,7 @@ mod tests {
     #[tokio::test]
     async fn set_channel_mapping_forwards_the_dto_and_returns_the_resolved_row() {
         let fake = fake_with_provider();
-        let state = fake_state().with_live_tv(fake.clone());
+        let (state, _) = state_recording_tasks(fake.clone());
         let response = set_channel_mapping(
             State(state),
             admin_auth(),
@@ -3212,100 +3192,124 @@ mod tests {
         assert_eq!(mapping.provider_channel_name.as_deref(), Some("HBO East"));
     }
 
+    /// An administrator's state over `fake`, and the task manager recording
+    /// what the handlers ask of it.
+    fn state_recording_tasks(
+        fake: std::sync::Arc<FakeLiveTv>,
+    ) -> (AppState, Arc<crate::test_support::RecordingTasks>) {
+        let tasks = Arc::new(crate::test_support::RecordingTasks::default());
+        let state = crate::test_support::elevated_state_with_library_monitor_and_tasks(
+            Arc::new(crate::test_support::FakeLibrary),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+            tasks.clone(),
+        )
+        .with_live_tv(fake);
+        (state, tasks)
+    }
+
+    /// Sends `method uri` through the router, with `body` as JSON if given.
+    async fn send(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        let body = body.map_or_else(Body::empty, |json| Body::from(json.to_owned()));
+        crate::create_router(state)
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Every Live TV configuration write ends with
+    /// `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()` upstream
+    /// (`TunerHostManager.SaveTunerHost` and `DeleteTunerHost`,
+    /// `ListingsManager.SaveListingProvider`, `DeleteListingsProvider` and
+    /// `SetChannelMapping`): the refresh is a run of the "Refresh Guide" task,
+    /// which the dashboard shows and can stop. The route asks the registry for
+    /// it and never refreshes the guide itself.
+    #[rstest::rstest]
+    #[case::save_tuner(
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(r#"{"Type":"m3u","Url":"http://tuner.invalid/a.m3u"}"#),
+        200
+    )]
+    #[case::delete_tuner("DELETE", "/LiveTv/TunerHosts?id=tuner1", None, 204)]
+    #[case::save_provider(
+        "POST",
+        "/LiveTv/ListingProviders",
+        Some(r#"{"Id":"prov1","Type":"xmltv","Path":"/guide.xml"}"#),
+        200
+    )]
+    #[case::delete_provider("DELETE", "/LiveTv/ListingProviders?id=prov1", None, 204)]
+    #[case::map_channel(
+        "POST",
+        "/LiveTv/ChannelMappings",
+        Some(r#"{"ProviderId":"prov1","TunerChannelId":"10","ProviderChannelId":"HBO"}"#),
+        200
+    )]
+    // A tuner channel no lineup has: upstream stores the pair and queues the
+    // task, and only then throws from `.First(...)` (a 500, the 404 here).
+    #[case::map_unknown_channel(
+        "POST",
+        "/LiveTv/ChannelMappings",
+        Some(r#"{"ProviderId":"prov1","TunerChannelId":"gone","ProviderChannelId":"HBO"}"#),
+        404
+    )]
     #[tokio::test]
-    async fn a_config_write_queues_the_guide_refresh_and_never_awaits_it() {
-        // Upstream every Live TV configuration write ends with
-        // `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()` and returns —
-        // the rebuild is the task's work. This fake's refresh never finishes, so
-        // a handler that awaited it could not answer at all.
-        let fake = std::sync::Arc::new(FakeLiveTv {
-            hang_refresh: true,
-            ..FakeLiveTv::default()
-        });
-        let state = fake_state().with_live_tv(fake.clone());
-        let saved = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            add_listing_provider(
-                State(state),
-                admin_auth(),
-                Query(AddListingProviderQuery::default()),
-                JsonBody(ListingsProviderInfo {
-                    id: Some("prov1".to_owned()),
-                    ..ListingsProviderInfo::default()
-                }),
-            ),
-        )
-        .await
-        .expect("the handler must not block on the guide refresh")
-        .expect("save")
-        .0;
-        assert_eq!(saved.id.as_deref(), Some("prov1"));
-        // …and it really was QUEUED, not skipped: the spawned refresh started.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fake.refresh_started.notified(),
-        )
-        .await
-        .expect("the write must queue a guide refresh");
+    async fn a_configuration_write_queues_the_refresh_guide_task(
+        #[case] method: &str,
+        #[case] uri: &str,
+        #[case] body: Option<&str>,
+        #[case] status: u16,
+    ) {
+        let fake = fake_with_provider();
+        let (state, tasks) = state_recording_tasks(fake.clone());
+        assert_eq!(send(state, method, uri, body).await.as_u16(), status);
+        // By its wire id, which is what the registry finds a task by
+        // (`POST /ScheduledTasks/Running/{taskId}` carries the same).
         assert_eq!(
-            fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "exactly one refresh per configuration write"
+            *tasks.requeued.lock().unwrap(),
+            [ferrofin_traits::tasks::task_id_for_key("RefreshGuide")]
         );
+        // In one call: a start after a cancel would be refused while the
+        // cancelled run is still stopping.
+        assert!(tasks.cancelled.lock().unwrap().is_empty());
+        assert!(tasks.started.lock().unwrap().is_empty());
+        // The rebuild is the task's work, not the request's.
+        assert_eq!(fake.refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
-    /// A queued refresh runs in a `guide_refresh` span of its own, not in the
-    /// request's (LOGGING.md, rule 4).
+    /// An unknown provider stores nothing, so it queues nothing: upstream's
+    /// `.First(...)` throws before it saves.
     #[tokio::test]
-    async fn a_queued_guide_refresh_runs_in_a_span_of_its_own() {
-        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-        let fake = std::sync::Arc::new(FakeLiveTv::default());
-        let manager: std::sync::Arc<dyn ferrofin_traits::stubs::LiveTvManager> = fake.clone();
-        tracing::info_span!("request").in_scope(|| queue_guide_refresh(&manager));
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fake.refresh_started.notified(),
-        )
-        .await
-        .expect("the refresh started");
-        assert_eq!(*fake.refresh_spans.lock().unwrap(), [Some("guide_refresh")]);
+    async fn a_mapping_for_an_unknown_provider_queues_no_guide_refresh() {
+        let (state, tasks) = state_recording_tasks(fake_with_provider());
+        let body = r#"{"ProviderId":"missing","TunerChannelId":"1","ProviderChannelId":"2"}"#;
+        let status = send(state, "POST", "/LiveTv/ChannelMappings", Some(body)).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert!(tasks.requeued.lock().unwrap().is_empty());
     }
 
-    /// `TunerHostManager.DeleteTunerHost` queues the guide refresh whose
-    /// `CleanDatabase` removes the host's channel and programme items, and the
-    /// DELETE answers `204` without waiting for it.
+    /// The write is stored by the time its refresh is queued, so a registry
+    /// that refuses the run (it is shutting down) does not fail the request.
     #[tokio::test]
-    async fn deleting_a_tuner_host_queues_the_guide_refresh() {
-        let fake = std::sync::Arc::new(FakeLiveTv {
-            hang_refresh: true,
-            ..FakeLiveTv::default()
-        });
-        let state = fake_state().with_live_tv(fake.clone());
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            delete_tuner_host(
-                State(state),
-                admin_auth(),
-                Query(IdQuery {
-                    id: "tuner1".to_owned(),
-                }),
-            ),
-        )
-        .await
-        .expect("the handler must not block on the guide refresh")
-        .expect("delete");
+    async fn a_write_answers_when_the_guide_refresh_cannot_be_queued() {
+        let (state, tasks) = state_recording_tasks(fake_with_provider());
+        tasks
+            .refuse_queue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let status = send(state, "DELETE", "/LiveTv/TunerHosts?id=tuner1", None).await;
         assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fake.refresh_started.notified(),
-        )
-        .await
-        .expect("the delete must queue a guide refresh");
-        assert_eq!(
-            fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "exactly one refresh per delete"
-        );
+        assert_eq!(tasks.requeued.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3354,61 +3358,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn set_channel_mapping_unknown_provider_is_404() {
-        let fake = std::sync::Arc::new(FakeLiveTv::default());
-        let state = fake_state().with_live_tv(fake.clone());
-        let err = set_channel_mapping(
-            State(state),
-            admin_auth(),
-            JsonBody(SetChannelMappingDto {
-                provider_id: "missing".into(),
-                tuner_channel_id: "1".into(),
-                provider_channel_id: "2".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
-        // Upstream's `.First(...)` throws before anything is saved or queued.
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                fake.refresh_started.notified()
-            )
-            .await
-            .is_err(),
-            "no guide refresh for an unknown provider"
-        );
-    }
-
-    /// A tuner channel no lineup channel has: upstream stores the pair, queues
-    /// the guide refresh, and only then throws from `.First(...)` (a 500, the
-    /// 404 here), so the refresh is queued here too.
-    #[tokio::test]
-    async fn set_channel_mapping_queues_the_refresh_before_an_unknown_channels_404() {
-        let fake = fake_with_provider();
-        let state = fake_state().with_live_tv(fake.clone());
-        let err = set_channel_mapping(
-            State(state),
-            admin_auth(),
-            JsonBody(SetChannelMappingDto {
-                provider_id: "prov1".into(),
-                tuner_channel_id: "gone".into(),
-                provider_channel_id: "HBO".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fake.refresh_started.notified(),
-        )
-        .await
-        .expect("the stored pair must queue a guide refresh");
     }
 
     /// `SetChannelMappingDto`'s three `[Required]` members: one left out, sent

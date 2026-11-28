@@ -20,7 +20,6 @@ image.workspace = true
 kamadak-exif.workspace = true
 webp.workspace = true
 turbojpeg.workspace = true
-jpeg-decoder.workspace = true
 blurhash.workspace = true
 fast_image_resize.workspace = true
 flate2.workspace = true

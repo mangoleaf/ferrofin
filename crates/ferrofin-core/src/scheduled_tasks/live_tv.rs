@@ -110,6 +110,18 @@ mod tests {
         tuners: AtomicBool,
         /// A Stop arrives while the refresh runs.
         stopped_inside: AtomicBool,
+        /// When set, a refresh runs until it is stopped or `released`.
+        held: AtomicBool,
+        /// Lets one held refresh finish.
+        released: tokio::sync::Notify,
+        /// The configuration writes so far.
+        writes: AtomicU32,
+        /// How many writes each held refresh found stored as it started.
+        read: std::sync::Mutex<Vec<u32>>,
+        /// The held refreshes under way.
+        running: AtomicU32,
+        /// Whether two held refreshes ever ran at once.
+        overlapped: AtomicBool,
     }
 
     /// What [`FakeLiveTv`]'s refresh reports through the run it is handed.
@@ -142,6 +154,20 @@ mod tests {
             run.report(REFRESH_REPORT);
             if self.stopped_inside.load(Ordering::Relaxed) {
                 run.cancel_token().cancel();
+            }
+            if self.held.load(Ordering::Relaxed) {
+                // Read before it shows as running: a test that waits for a
+                // running refresh then knows what that one read.
+                let stored = self.writes.load(Ordering::SeqCst);
+                self.read.lock().expect("read").push(stored);
+                if self.running.fetch_add(1, Ordering::SeqCst) > 0 {
+                    self.overlapped.store(true, Ordering::SeqCst);
+                }
+                let _ = run
+                    .cancel_token()
+                    .unless_cancelled(self.released.notified())
+                    .await;
+                self.running.fetch_sub(1, Ordering::SeqCst);
             }
             Ok(!run.cancel_token().is_cancelled())
         }
@@ -346,6 +372,86 @@ mod tests {
             progress.reported(),
             Some(REFRESH_REPORT),
             "the refresh's own report, and no 100 % for a stopped refresh"
+        );
+    }
+
+    /// A Live TV configuration write: it stores its change, then asks for the
+    /// task as upstream's `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`.
+    async fn write(fake: &FakeLiveTv, tasks: &crate::scheduled_tasks::FerrofinTaskManager) {
+        fake.writes.fetch_add(1, Ordering::SeqCst);
+        let id = ferrofin_traits::tasks::task_id_for_key("RefreshGuide");
+        ferrofin_traits::tasks::TaskManager::cancel_if_running_and_queue(tasks, &id)
+            .await
+            .expect("queued");
+    }
+
+    /// The last write is never lost. A refresh is under way when the other
+    /// writes arrive, all at the same moment: it is stopped, and the run that
+    /// ends last started after every write, so it read them all. No two
+    /// refreshes ever run at once, however many writes ask for one.
+    #[rstest::rstest]
+    #[case::two(2)]
+    #[case::many(33)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refresh_that_ends_last_started_after_the_last_write(#[case] writes: u32) {
+        let fake = Arc::new(FakeLiveTv::default());
+        fake.held.store(true, Ordering::Relaxed);
+        let tasks = crate::scheduled_tasks::FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshGuideTask::new(fake.clone())));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+        write(&fake, &tasks).await;
+        while fake.running.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no refresh started");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let together = Arc::new(tokio::sync::Barrier::new(writes as usize - 1));
+        let later: Vec<_> = (1..writes)
+            .map(|_| {
+                let (fake, tasks, together) = (fake.clone(), tasks.clone(), together.clone());
+                tokio::spawn(async move {
+                    together.wait().await;
+                    write(&fake, &tasks).await;
+                })
+            })
+            .collect();
+        for write in later {
+            write.await.expect("write");
+        }
+
+        // Every write has answered. Refreshes are let finish from here on, and
+        // the task comes to rest on one that read every write.
+        loop {
+            fake.released.notify_one();
+            let task = tasks.get("RefreshGuide").expect("task");
+            let completed = task.last_execution_result.is_some_and(|result| {
+                result.status == ferrofin_model::tasks::TaskCompletionStatus::Completed
+            });
+            let read = fake.read.lock().expect("read").clone();
+            if task.state == ferrofin_model::tasks::TaskState::Idle
+                && completed
+                && read.last() == Some(&writes)
+            {
+                assert_eq!(read.first(), Some(&1), "the first write started a refresh");
+                assert!(
+                    read.is_sorted(),
+                    "a later refresh never read less: {read:?}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the last write was never refreshed: {writes} writes, refreshes read {read:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !fake.overlapped.load(Ordering::SeqCst),
+            "one refresh at a time"
+        );
+        assert!(
+            fake.refreshes.load(Ordering::Relaxed) <= writes,
+            "at most one refresh a write"
         );
     }
 

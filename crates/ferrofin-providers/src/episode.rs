@@ -11,6 +11,8 @@
 //! ([`crate::provider_manager`]); the library scan's own fold fills a row it
 //! already holds field by field and maps the same answers.
 
+use std::collections::BTreeMap;
+
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::PersonKind;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::container_types::PersonInfo;
 use crate::metadata_merge::MetadataResult;
 use crate::omdb::{OmdbItem, OmdbPersonKind};
-use crate::tmdb::{EpisodeDetails, EpisodeExtras, SeasonDetails};
+use crate::tmdb::{EpisodeDetails, EpisodeExtras, EpisodeGroup, SeasonDetails};
 use crate::tvdb::{TvdbEpisodeDetails, TvdbPerson};
 
 /// Port of `EpisodeMetadataService.BeforeSaveInternal`'s range guard (v12.2,
@@ -98,55 +100,119 @@ pub(crate) fn lookup_range_end(item: &BaseItemEntity) -> Option<i32> {
         .then_some(end)
 }
 
-/// The episode `TmdbEpisodeProvider.GetMetadata` reads from `season`'s listing
-/// for the lookup's `IndexNumber` (`start`) and `IndexNumberEnd` (`end`),
-/// `TmdbEpisodeProvider.cs:106-158`: without an end, the entry for `start`;
-/// with one, the first entry from `start` to `end` the season lists (an
-/// episode TMDB lacks is skipped), its name and overview followed by each
-/// later one's, joined by ` / `. The rest (ids, air date, rating) and the
-/// episode request for its credits, ids and videos are the first one's.
-/// `None` when the season lists none of them, as for an end below `start`:
-/// the caller drops a stored one first, as `BeforeSaveInternal` does.
-#[must_use]
-pub fn tmdb_episode_in_range(
-    season: &SeasonDetails,
-    start: i32,
-    end: Option<i32>,
-) -> Option<EpisodeDetails> {
-    let Some(end) = end else {
-        return season
-            .episodes
-            .iter()
-            .find(|entry| entry.episode_number == start)
-            .cloned();
-    };
-    // Each number once, the first listed, as `GetEpisodeAsync` asks per number.
-    let mut found: Vec<&EpisodeDetails> = Vec::new();
-    for entry in &season.episodes {
-        if (start..=end).contains(&entry.episode_number)
-            && !found
-                .iter()
-                .any(|kept| kept.episode_number == entry.episode_number)
-        {
-            found.push(entry);
+/// The episode `TmdbEpisodeProvider.GetMetadata` reads for the lookup's
+/// `IndexNumber` (`start`) and `IndexNumberEnd` (`end`) of season `season`,
+/// `TmdbEpisodeProvider.cs:106-162`, asking `GetEpisodeAsync` for each number
+/// in the series' display order (`TmdbClientManager.cs:286-297`): a number
+/// the series' episode group lists is read from its aired season's listing
+/// under its aired number, any other from `season`'s own listing under its
+/// own number. The caller fetches the listings [`seasons`](Self::seasons)
+/// names, then reads the [`episode`](Self::episode) from them.
+#[derive(Debug, Clone)]
+pub struct TmdbEpisodeLookup {
+    season: i32,
+    numbers: std::ops::RangeInclusive<i32>,
+    /// Each number the group lists → its aired season and episode.
+    aired: BTreeMap<i32, (i32, i32)>,
+}
+
+impl TmdbEpisodeLookup {
+    /// The lookup of episodes `start` to `end` (`start` alone without one)
+    /// of season `season`, through `group` when the series' order has one.
+    #[must_use]
+    pub fn new(
+        group: Option<&EpisodeGroup>,
+        season: i32,
+        (start, end): (i32, Option<i32>),
+    ) -> Self {
+        let numbers = start..=end.unwrap_or(start);
+        let aired = group.map_or_default(|group| group.aired_numbers_in(season, numbers.clone()));
+        Self {
+            season,
+            numbers,
+            aired,
         }
     }
-    found.sort_by_key(|entry| entry.episode_number);
-    let (first, rest) = found.split_first()?;
-    let mut episode = (*first).clone();
-    if !rest.is_empty() {
-        // A `StringBuilder` appends a null name or overview as nothing.
-        let joined = |field: fn(&EpisodeDetails) -> Option<&str>| {
-            found
-                .iter()
-                .map(|entry| field(entry).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        };
-        episode.name = Some(joined(|entry| entry.name.as_deref()));
-        episode.overview = Some(joined(|entry| entry.overview.as_deref()));
+
+    /// The seasons whose listings [`episode`](Self::episode) reads, each
+    /// once: the aired seasons of the numbers the group lists, then `season`
+    /// itself when some number is left that the group does not list. Those
+    /// numbers are read from `season`'s listing, so however far a range
+    /// reaches, only the episodes TMDB lists are looked at. None for an end
+    /// below the start: `GetEpisodeAsync` is never asked.
+    #[must_use]
+    pub fn seasons(&self) -> Vec<i32> {
+        let mut seasons: Vec<i32> = Vec::new();
+        for &(aired_season, _) in self.aired.values() {
+            if !seasons.contains(&aired_season) {
+                seasons.push(aired_season);
+            }
+        }
+        let count = i64::from(*self.numbers.end()) - i64::from(*self.numbers.start()) + 1;
+        if count > i64::try_from(self.aired.len()).unwrap_or(i64::MAX)
+            && !seasons.contains(&self.season)
+        {
+            seasons.push(self.season);
+        }
+        seasons
     }
-    Some(episode)
+
+    /// The episode, from the listings `listing` gives by aired season number:
+    /// without an end, that one episode; with one, every episode from `start`
+    /// to `end` TMDB has (one it lacks is skipped), by number, its name and
+    /// overview followed by each later one's, joined by ` / `. The rest (ids,
+    /// air date, rating) are the first one's, which comes back with its aired
+    /// season: its own request (credits, ids, videos) is asked under its
+    /// aired numbers. `None` when TMDB has none of them, as for an end below
+    /// `start`: the caller drops a stored one first, as `BeforeSaveInternal`
+    /// does.
+    #[must_use]
+    pub fn episode<'a>(
+        &self,
+        listing: impl Fn(i32) -> Option<&'a SeasonDetails>,
+    ) -> Option<(i32, EpisodeDetails)> {
+        // A listing's first entry for a number, as `GetEpisodeAsync` is asked
+        // per number.
+        let entry = |season: i32, number: i32| {
+            listing(season)?
+                .episodes
+                .iter()
+                .find(|entry| entry.episode_number == number)
+        };
+        let mut found: BTreeMap<i32, (i32, &EpisodeDetails)> = BTreeMap::new();
+        for (&number, &(aired_season, aired_episode)) in &self.aired {
+            if let Some(entry) = entry(aired_season, aired_episode) {
+                found.insert(number, (aired_season, entry));
+            }
+        }
+        if let Some(own) = listing(self.season) {
+            for entry in &own.episodes {
+                if self.numbers.contains(&entry.episode_number)
+                    && !self.aired.contains_key(&entry.episode_number)
+                {
+                    found
+                        .entry(entry.episode_number)
+                        .or_insert((self.season, entry));
+                }
+            }
+        }
+        let mut values = found.values();
+        let &(aired_season, first) = values.next()?;
+        let mut episode = first.clone();
+        if values.next().is_some() {
+            // A `StringBuilder` appends a null name or overview as nothing.
+            let joined = |field: fn(&EpisodeDetails) -> Option<&str>| {
+                found
+                    .values()
+                    .map(|(_, entry)| field(entry).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            episode.name = Some(joined(|entry| entry.name.as_deref()));
+            episode.overview = Some(joined(|entry| entry.overview.as_deref()));
+        }
+        Some((aired_season, episode))
+    }
 }
 
 /// `TmdbEpisodeProvider.GetMetadata`'s answer for episode `episode_number` of
@@ -479,28 +545,140 @@ mod tests {
     /// every episode TMDB lists in it, the first one's id and date, and joins
     /// their names and overviews with ` / ` (a missing overview adds nothing
     /// between the separators); a range TMDB lists one episode of, or none,
-    /// is that one alone, or nothing; no range is the start alone.
+    /// is that one alone, or nothing; no range is the start alone. A range
+    /// that ends before it starts asks for nothing.
     #[rstest::rstest]
-    #[case::single(1, None, Some(("One", Some("First."), 9001)))]
-    #[case::range(1, Some(2), Some(("One / Two", Some("First. / "), 9001)))]
-    #[case::gap_skipped(1, Some(4), Some(("One / Two / Four", Some("First. /  / Fourth."), 9001)))]
-    #[case::first_missing(3, Some(4), Some(("Four", Some("Fourth."), 9004)))]
-    #[case::none_listed(5, Some(6), None)]
-    #[case::reversed(2, Some(1), None)]
+    #[case::single(1, None, Some(("One", Some("First."), 9001)), 1)]
+    #[case::range(1, Some(2), Some(("One / Two", Some("First. / "), 9001)), 1)]
+    #[case::gap_skipped(1, Some(4), Some(("One / Two / Four", Some("First. /  / Fourth."), 9001)), 1)]
+    #[case::first_missing(3, Some(4), Some(("Four", Some("Fourth."), 9004)), 1)]
+    #[case::none_listed(5, Some(6), None, 1)]
+    #[case::reversed(2, Some(1), None, 0)]
     fn a_tmdb_episode_range_joins_what_the_season_lists(
         #[case] start: i32,
         #[case] end: Option<i32>,
         #[case] expected: Option<(&str, Option<&str>, i64)>,
+        #[case] listings: usize,
     ) {
-        let found = tmdb_episode_in_range(&listed_season(), start, end);
+        let lookup = TmdbEpisodeLookup::new(None, 1, (start, end));
+        let season = listed_season();
+        let found = lookup.episode(|number| (number == 1).then_some(&season));
         assert_eq!(
-            found.as_ref().map(|e| (
+            found.as_ref().map(|(season, e)| (
+                *season,
                 e.name.as_deref().unwrap_or_default(),
                 e.overview.as_deref(),
                 e.tmdb_id.unwrap_or_default()
             )),
-            expected
+            expected.map(|(name, overview, id)| (1, name, overview, id))
         );
+        assert_eq!(
+            lookup.seasons(),
+            vec![1; listings],
+            "season 1's listing only"
+        );
+    }
+
+    /// Season 1's episodes in an order TMDb keeps a group for:
+    /// `GetEpisodeAsync` maps 1 to aired S02E04 and 2 to S03E01 through the
+    /// group's first season 1, and keeps 4, which it does not list.
+    fn reordered() -> EpisodeGroup {
+        serde_json::from_str(
+            r#"{"groups": [
+                {"order": 2, "episodes": [{"order": 0, "season_number": 9, "episode_number": 9}]},
+                {"order": 1, "episodes": [
+                    {"order": 0, "season_number": 2, "episode_number": 4},
+                    {"order": 0, "season_number": 9, "episode_number": 9},
+                    {"order": 1, "season_number": 3, "episode_number": 1}]},
+                {"order": 1, "episodes": [{"order": 3, "season_number": 9, "episode_number": 9}]}
+            ]}"#,
+        )
+        .expect("group")
+    }
+
+    /// `TmdbClientManager.GetEpisodeAsync` (v12.4 `:286-297`): the first
+    /// season of the group whose `Order` is the season, then its first episode
+    /// whose `Order` is the number less one; a number it does not list, and
+    /// a season it has none of, keep their own numbers.
+    #[rstest::rstest]
+    #[case::first_of_the_order(1, 1, Some((2, 4)))]
+    #[case::second(1, 2, Some((3, 1)))]
+    #[case::not_in_the_first_season_1(1, 4, None)]
+    #[case::other_season(2, 1, Some((9, 9)))]
+    #[case::no_such_season(5, 1, None)]
+    #[case::order_minus_one(1, 0, None)]
+    fn an_episode_group_maps_an_episode_to_its_aired_numbers(
+        #[case] season: i32,
+        #[case] episode: i32,
+        #[case] expected: Option<(i32, i32)>,
+    ) {
+        assert_eq!(reordered().aired_numbers(season, episode), expected);
+    }
+
+    /// A range in a group's order asks each number under the aired numbers the
+    /// group maps it to, in order of number, and reads a number the group does
+    /// not list from the season's own listing: here 1 is aired S02E04 and 2 is
+    /// S03E01, while 4, unlisted, is season 1's own episode 4. The first one's
+    /// aired season comes back with it, for its own request.
+    #[test]
+    fn a_range_in_a_groups_order_joins_each_episode_under_its_aired_numbers() {
+        let aired = |season: i32, number: i32, name: &str| EpisodeDetails {
+            tmdb_id: Some(i64::from(season * 100 + number)),
+            episode_number: number,
+            name: Some(name.to_owned()),
+            ..EpisodeDetails::default()
+        };
+        let group = reordered();
+        let lookup = TmdbEpisodeLookup::new(Some(&group), 1, (1, Some(4)));
+        let listings = [
+            (1, listed_season()),
+            (
+                2,
+                SeasonDetails {
+                    episodes: vec![aired(2, 4, "Aired 2x4")],
+                    ..SeasonDetails::default()
+                },
+            ),
+            (
+                3,
+                SeasonDetails {
+                    episodes: vec![aired(3, 1, "Aired 3x1")],
+                    ..SeasonDetails::default()
+                },
+            ),
+        ];
+        assert_eq!(lookup.seasons(), vec![2, 3, 1]);
+        let found = lookup
+            .episode(|season| {
+                listings
+                    .iter()
+                    .find(|(number, _)| *number == season)
+                    .map(|(_, listing)| listing)
+            })
+            .expect("found");
+        assert_eq!(found.0, 2, "the first one's aired season");
+        assert_eq!(found.1.tmdb_id, Some(204));
+        assert_eq!(found.1.episode_number, 4, "its aired number");
+        assert_eq!(
+            found.1.name.as_deref(),
+            Some("Aired 2x4 / Aired 3x1 / Four")
+        );
+    }
+
+    /// Every number of the range in the group: season 1's own listing is not
+    /// asked, as `GetEpisodeAsync` asks no episode in aired order; one the
+    /// group lacks is asked under its own numbers.
+    #[rstest::rstest]
+    #[case::whole(1, Some(2), vec![2, 3])]
+    #[case::one_unlisted(1, Some(3), vec![2, 3, 1])]
+    #[case::another_season(2, None, vec![9])]
+    fn a_lookup_in_a_groups_order_asks_only_the_seasons_it_reads(
+        #[case] season: i32,
+        #[case] end: Option<i32>,
+        #[case] expected: Vec<i32>,
+    ) {
+        let lookup = TmdbEpisodeLookup::new(Some(&reordered()), season, (1, end));
+        assert_eq!(lookup.seasons(), expected);
     }
 
     /// An episode row with `IndexNumber` `start` and `Data.IndexNumberEnd` `end`.

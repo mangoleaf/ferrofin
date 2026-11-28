@@ -582,6 +582,16 @@ async fn get_available_options(
         .providers
         .get_library_options_info(&item_types, query.is_new_library)
         .await?;
+    // A disabled plugin's subtitle provider is not loaded upstream, so it is
+    // no subtitle fetcher a library can pick (gl-2025).
+    if let Some(enabled) = state.subtitles.enabled_provider_names().await {
+        options.subtitle_fetchers.retain(|fetcher| {
+            fetcher
+                .name
+                .as_deref()
+                .is_some_and(|name| enabled.iter().any(|enabled| enabled == name))
+        });
+    }
     options.media_segment_providers = state
         .media_segments
         .registered_segment_providers()

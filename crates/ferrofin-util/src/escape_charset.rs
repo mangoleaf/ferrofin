@@ -16,6 +16,8 @@
 //! pages 50225 and 52936. ISO-2022-JP's callers decode through `chardetng`
 //! (gl-1422), so its machine only decides which designation comes first.
 
+use crate::code_page;
+
 /// A 7-bit escape encoding [`detect`] finds and [`EscapeCharset::decode`]
 /// decodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +44,9 @@ impl EscapeCharset {
     /// `bytes` decoded to text as .NET decodes them for Jellyfin: ports of
     /// `ISO2022Encoding.GetCharsCP52936` and `GetCharsCP50225KR` (.NET 10).
     /// Each pair is looked up in the 8-bit table it carries (code page 936,
-    /// which `encoding_rs`'s GBK reads, and 949's KS X 1001 rows, EUC-KR), and
-    /// what fails is `?`, the replacement those decoders fall back to.
+    /// which `encoding_rs`'s GBK reads, and 949's KS X 1001 rows, EUC-KR with
+    /// the two user-defined rows of [`code_page::user_defined`]), and what
+    /// fails is `?`, the replacement those decoders fall back to.
     #[must_use]
     pub fn decode(self, bytes: &[u8]) -> String {
         match self {
@@ -230,7 +233,13 @@ pub fn detect(bytes: &[u8]) -> Option<EscapeCharset> {
 }
 
 /// Pushes what `encoding`'s 8-bit pair `lead`, `trail` decodes to, or `?`.
+/// A pair of a user-defined row is what .NET's code page holds for it
+/// ([`code_page::user_defined`]).
 fn push_pair(out: &mut String, encoding: &'static encoding_rs::Encoding, lead: u8, trail: u8) {
+    if let Some(character) = code_page::user_defined(encoding, lead, trail) {
+        out.push(character);
+        return;
+    }
     match encoding.decode_without_bom_handling_and_without_replacement(&[lead, trail]) {
         Some(text) => out.push_str(&text),
         None => out.push('?'),
@@ -483,6 +492,9 @@ mod tests {
     #[case::a_broken_then_a_whole_designation(b"\x1b$)\x1b$)Ca", "\u{1b}$)a")]
     // A NUL lead is its trail alone.
     #[case::a_nul_lead(b"\x0e\x00a\x00\x0f", "a\u{f}")]
+    // Code page 949's user-defined rows, C9 and FE with the high bits set
+    // (gl-2000): the first and last cell of each.
+    #[case::user_defined_rows(b"\x0eI!I~~!~~\x0f", "\u{E000}\u{E05D}\u{E05E}\u{E0BB}")]
     fn decodes_iso_2022_kr_as_dotnet_does(#[case] bytes: &[u8], #[case] text: &str) {
         assert_eq!(EscapeCharset::Iso2022Kr.decode(bytes), text, "{bytes:?}");
     }

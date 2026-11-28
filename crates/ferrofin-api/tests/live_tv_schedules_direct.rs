@@ -19,7 +19,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
-use ferrofin_api::test_support::{authed_fake_state, elevated_fake_state, fake_state};
+use ferrofin_api::test_support::{
+    FakeLibrary, RecordingTasks, authed_fake_state, elevated_fake_state,
+    elevated_state_with_library_monitor_and_tasks, fake_state,
+};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::live_tv::{
@@ -197,9 +200,8 @@ impl LiveTvManager for CountriesLiveTv {
     async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
-    /// The refresh a provider save queues; nothing to rebuild here.
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
-        Ok(())
+        unreachable!()
     }
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         unreachable!()
@@ -315,6 +317,17 @@ async fn is_elevation_gated() {
     assert_eq!(manager.calls.load(Ordering::SeqCst), 0);
 }
 
+/// An administrator's state over `manager` for a provider save, which ends by
+/// queuing the "Refresh Guide" task: the task manager takes that request.
+fn saving_state(manager: &Arc<CountriesLiveTv>) -> AppState {
+    elevated_state_with_library_monitor_and_tasks(
+        Arc::new(FakeLibrary),
+        Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+        Arc::new(RecordingTasks::default()),
+    )
+    .with_live_tv(manager.clone())
+}
+
 /// Sends `method uri` with an optional JSON body to the real router.
 async fn send(
     state: AppState,
@@ -348,7 +361,7 @@ async fn send(
 #[tokio::test]
 async fn the_dashboard_login_save_forwards_validate_login_and_keeps_the_password() {
     let manager = CountriesLiveTv::serving(SD_COUNTRIES);
-    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let state = saving_state(&manager);
     let (status, body) = send(
         state,
         "POST",
@@ -378,7 +391,7 @@ async fn the_dashboard_login_save_forwards_validate_login_and_keeps_the_password
 #[tokio::test]
 async fn pw_is_stored_as_its_lowercase_sha1_and_validate_listings_is_forwarded() {
     let manager = CountriesLiveTv::serving(SD_COUNTRIES);
-    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let state = saving_state(&manager);
     let body = r#"{"Type":"SchedulesDirect","Username":"user","Password":"body"}"#;
     let (status, _) = send(
         state.clone(),
@@ -419,7 +432,7 @@ async fn pw_is_stored_as_its_lowercase_sha1_and_validate_listings_is_forwarded()
 #[tokio::test]
 async fn null_tuner_and_mapping_lists_bind_as_empty() {
     let manager = CountriesLiveTv::serving(SD_COUNTRIES);
-    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let state = saving_state(&manager);
     let (status, body) = send(
         state,
         "POST",
@@ -444,7 +457,7 @@ async fn null_tuner_and_mapping_lists_bind_as_empty() {
 #[tokio::test]
 async fn a_null_list_element_binds_and_is_kept() {
     let manager = CountriesLiveTv::serving(SD_COUNTRIES);
-    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let state = saving_state(&manager);
     let (status, body) = send(
         state,
         "POST",
