@@ -372,6 +372,20 @@ issue = 666
 reason = "Jellyfin answers this error with its exception middleware's text (or an empty body); Ferrofin with a JSON object."
 
 [[entry]]
+request = "GetTunerHostTypes"
+path = "$"
+kind = "length"
+verified = "GET /LiveTv/TunerHosts/Types"
+reason = "Ferrofin adds Linux DVB to the list on Linux."
+
+[[entry]]
+request = "GetTunerHostTypes"
+path = "[].Id"
+kind = "value"
+verified = "GET /LiveTv/TunerHosts/Types"
+reason = "The additional Linux DVB type sorts before M3U Tuner and shifts its index."
+
+[[entry]]
 request = "AddTunerHost"
 path = "$"
 kind = "value"

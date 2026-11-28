@@ -567,13 +567,22 @@ pub async fn open_shared_http_stream(
     headers: &HashMap<String, String>,
     transcode_dir: &Path,
 ) -> Result<OpenedSharedStream, ServiceError> {
+    let body = source.open(url, headers).await?;
+    open_shared_body(body, transcode_dir, &crate::fetch::redact_url(url)).await
+}
+
+/// Buffers a transport stream from a tuner body, regardless of its transport.
+pub(crate) async fn open_shared_body(
+    body: Box<dyn TunerStreamBody>,
+    transcode_dir: &Path,
+    tuner: &str,
+) -> Result<OpenedSharedStream, ServiceError> {
     let unique_id = Uuid::new_v4().simple().to_string();
     let temp_path = transcode_dir.join(format!("{unique_id}.ts"));
     tokio::fs::create_dir_all(transcode_dir)
         .await
         .map_err(|e| LiveTvError::io(format!("create {}", transcode_dir.display()), e))?;
 
-    let body = source.open(url, headers).await?;
     let alive = Arc::new(AtomicBool::new(true));
     let (first_byte_tx, first_byte_rx) = oneshot::channel();
     let task = tokio::spawn(copy_to_temp_file(
@@ -582,6 +591,10 @@ pub async fn open_shared_http_stream(
         first_byte_tx,
         Arc::clone(&alive),
     ));
+    let mut pending = PendingSharedOpen {
+        task: Some(task),
+        temp_path: temp_path.clone(),
+    };
 
     let first_byte = tokio::time::timeout(
         std::time::Duration::from_secs(FIRST_BYTE_TIMEOUT_SECONDS),
@@ -594,15 +607,42 @@ pub async fn open_shared_http_stream(
             temp_path,
             opened_at: Utc::now(),
             alive,
-            task,
+            task: pending
+                .task
+                .take()
+                .ok_or_else(|| ServiceError::backend("missing live stream task"))?,
         })
     } else {
-        task.abort();
+        if let Some(task) = pending.task.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
         let _ = tokio::fs::remove_file(&temp_path).await;
+        pending.task.take();
         Err(ServiceError::backend(format!(
-            "zero bytes copied from live stream {}",
-            crate::fetch::redact_url(url)
+            "zero bytes copied from live stream {tuner}"
         )))
+    }
+}
+
+// A caller can give up while the tuner is still waiting for its first byte.
+struct PendingSharedOpen {
+    task: Option<JoinHandle<()>>,
+    temp_path: PathBuf,
+}
+
+impl Drop for PendingSharedOpen {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let path = self.temp_path.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = task.await;
+                    let _ = tokio::fs::remove_file(path).await;
+                });
+            }
+        }
     }
 }
 

@@ -21,6 +21,8 @@ use ferrofin_model::live_tv::TunerHostInfo;
 use ferrofin_traits::error::ServiceError;
 
 use crate::fetch::SourceFetcher;
+#[cfg(target_os = "linux")]
+pub use crate::linux_dvb::DvbStreamPlan;
 use crate::m3u::{M3uParser, is_valid_channel_url};
 
 /// One channel as a tuner reported it, before anything is persisted.
@@ -83,9 +85,8 @@ pub struct StoredChannel {
 
 /// How the manager must open the stream a host chose.
 ///
-/// The two arms are upstream's two `ILiveStream` implementations: every host
-/// but the legacy HDHomeRun control path returns a `SharedHttpStream`, and the
-/// legacy path returns an `HdHomerunUdpStream`.
+/// Network tuners use HTTP or legacy HDHomeRun RTP. Local DVB capture
+/// supplies the transport stream from the tuner process's stdout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelStreamKind {
     /// Open `MediaSourceInfo.Path` over HTTP and share the buffered copy
@@ -94,6 +95,9 @@ pub enum ChannelStreamKind {
     /// Drive the device's UDP control protocol and receive RTP
     /// (`HdHomerunUdpStream`).
     LegacyUdp(Box<crate::hdhomerun::LegacyUdpPlan>),
+    /// Capture an MPEG transport stream from a local DVB adapter.
+    #[cfg(target_os = "linux")]
+    LinuxDvb(DvbStreamPlan),
 }
 
 /// The stream one host chose for one channel: the media source to hand back
@@ -102,7 +106,7 @@ pub enum ChannelStreamKind {
 pub struct ChannelStream {
     /// The media source, already carrying the path to open.
     pub source: MediaSourceInfo,
-    /// Which of upstream's two live-stream shapes this is.
+    /// How to open the selected stream.
     pub kind: ChannelStreamKind,
 }
 
