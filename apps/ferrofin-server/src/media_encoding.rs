@@ -403,8 +403,10 @@ pub fn build_media_encoding(
             std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS),
         ));
     }
+    // A request naming a running job's play session reads that job's source.
+    let jobs: Arc<dyn ferrofin_traits::media_encoding::TranscodeManager> = manager.clone();
     let mut hls_impl = HlsStreamManagerImpl::new(
-        planner,
+        planner.with_jobs(jobs),
         transcoder,
         manager,
         generator,
@@ -1503,6 +1505,8 @@ mod tests {
             job_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
             device_id: Some("dev".to_owned()),
             live_stream_id: live_stream_id.map(str::to_owned),
+            media_source: None,
+            user_id: None,
         }
     }
 

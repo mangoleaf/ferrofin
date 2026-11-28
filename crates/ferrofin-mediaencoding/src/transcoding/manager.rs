@@ -719,9 +719,9 @@ struct RegisteredJob {
     /// The live process + cache metadata when this job was spawned via
     /// `start_ffmpeg`; `None` for registry-only jobs (lookup tests).
     running: Option<RunningJob>,
-    /// The user the job transcodes for, counted against
-    /// [`TranscodeLimits::per_user`]; `None` for a userless API key and for
-    /// registry-only jobs.
+    /// The user the job transcodes for (its handle's), counted against
+    /// [`TranscodeLimits::per_user`]; `None` for a userless API key and for a
+    /// registry-only job registered without one.
     user_id: Option<uuid::Uuid>,
     /// Whether the job re-encodes any stream, so a [`TranscodeLimits`] cap
     /// counts it ([`EncodingJobInfo::encodes_any_stream`]).
@@ -1171,7 +1171,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             last_activity: std::time::Instant::now(),
             handle: handle.clone(),
             running: None,
-            user_id: None,
+            user_id: handle.user_id,
             encodes: false,
             superseded: false,
         };
@@ -1179,7 +1179,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         handle
     }
 
-    /// [`register_job`](Self::register_job) for a starting job of `user`, past
+    /// [`register_job`](Self::register_job) for a starting job of its handle's user, past
     /// the [`TranscodeLimits`] check when it `encodes`, returning the idle job
     /// of the same device (`handle.device_id`) it replaces, if any, for the
     /// caller to tear down, and the exited or superseded jobs of its output it
@@ -1195,9 +1195,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     fn register_job_for_user(
         &self,
         handle: &TranscodingJobHandle,
-        user: Option<uuid::Uuid>,
         encodes: bool,
     ) -> Result<(Option<RegisteredJob>, Vec<RegisteredJob>), TranscodeRefused> {
+        let user = handle.user_id;
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
         let evicted = if encodes {
             take_job_to_admit(&mut jobs, self.limits, user, handle.device_id.as_deref())?
@@ -1322,6 +1322,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             job_type: state.transcoding_type,
             device_id: state.device_id.clone(),
             live_stream_id: state.base_request.live_stream_id.clone(),
+            media_source: Some(std::sync::Arc::new(state.media_source.clone())),
+            user_id,
         };
 
         // 0. Admission, ahead of everything else: a refused job leaves no
@@ -1334,7 +1336,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // a count that stays: a start cancelled by a client disconnect drops
         // it, so its job is still reaped.
         let (evicted, mut replaced) =
-            self.register_job_for_user(&handle, user_id, state.encodes_any_stream())?;
+            self.register_job_for_user(&handle, state.encodes_any_stream())?;
         let _startup = TranscodeRequestGuard {
             manager: self,
             handle: handle.clone(),
@@ -1404,11 +1406,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
-        let target = state
-            .wait_for_path
-            .clone()
-            .unwrap_or_else(|| output_path.to_path_buf());
-        self.wait_for_first_output(&handle, &target).await?;
+        let target = state.wait_for_path.as_deref().unwrap_or(output_path);
+        self.wait_for_first_output(&handle, target).await?;
 
         self.wait_for_progressive_buffer(&handle, state).await;
 
@@ -2564,6 +2563,8 @@ mod tests {
             job_type,
             device_id: Some(device.to_owned()),
             live_stream_id: None,
+            media_source: None,
+            user_id: None,
         }
     }
 
@@ -3424,6 +3425,45 @@ mod start_ffmpeg_tests {
             .stream_progress(&output.to_string_lossy())
             .expect("the retry's job serves the output");
         assert!(!observer.has_exited(), "the retry's own job answers");
+    }
+
+    /// `OnTranscodeBeginning`'s `MediaSource = state.MediaSource`: a started
+    /// job carries the source it reads and the user it is for, which
+    /// `GetTranscodingJob(playSessionId)` hands to the next stream request of
+    /// that play session.
+    #[tokio::test]
+    async fn a_started_job_carries_the_source_it_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let mut st = state(&playlist, Some(&playlist));
+        st.media_source.id = Some("version-b".to_owned());
+        let user = uuid::Uuid::from_u128(0x5E);
+        m.start_ffmpeg(
+            &fake,
+            StartFfMpegRequest {
+                user_id: Some(user),
+                ..ffmpeg_req(&st, &playlist, vec![])
+            },
+        )
+        .await
+        .unwrap();
+        let job = m
+            .get_transcoding_job_by_session("SESS")
+            .await
+            .unwrap()
+            .expect("the job");
+        assert_eq!(job.user_id, Some(user));
+        assert_eq!(
+            job.media_source
+                .and_then(|source| source.id.clone())
+                .as_deref(),
+            Some("version-b")
+        );
     }
 
     /// A start whose ffmpeg never runs, on the output of a job stopped for it,
@@ -5666,6 +5706,8 @@ mod partial_files_tests {
             job_type,
             device_id: Some("dev1".to_owned()),
             live_stream_id: None,
+            media_source: None,
+            user_id: None,
         };
 
         let logs = CapturedLogs::default();
@@ -5755,6 +5797,8 @@ mod partial_files_tests {
             job_type: TranscodingJobType::Progressive,
             device_id: Some("dev1".to_owned()),
             live_stream_id: None,
+            media_source: None,
+            user_id: None,
         };
         let manager = Arc::new(super::TranscodeManagerImpl::new(super::NoopSessionReporter));
         let cleaner = Arc::new(TakingCleaner {

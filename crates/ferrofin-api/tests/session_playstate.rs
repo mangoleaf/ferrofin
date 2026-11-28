@@ -888,6 +888,8 @@ impl HlsStreamManager for RecordingHls {
                 job_type: TranscodingJobType::Hls,
                 device_id: None,
                 live_stream_id: None,
+                media_source: None,
+                user_id: None,
             }))
     }
 }
