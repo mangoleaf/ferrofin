@@ -11713,9 +11713,18 @@ impl LibraryScanner {
                     stream.stream_type == ferrofin_model::entities::MediaStreamType::Video
                 })
                 .map(|stream| stream.index);
+            // `video.Timestamp = mediaInfo.Timestamp` (`FFProbeVideoInfo.cs:247`):
+            // the probe reads one for a local TS/M2TS file only; none is no key
+            // (`overlay_probe_data` clears a stored one).
+            let timestamp = source
+                .timestamp
+                .map(|timestamp| serde_json::json!(timestamp));
             if let Some(data) = crate::item_data::merge_data_fields(
                 entity.data.as_deref(),
-                &[("DefaultVideoStreamIndex", Some(serde_json::json!(index)))],
+                &[
+                    ("DefaultVideoStreamIndex", Some(serde_json::json!(index))),
+                    ("Timestamp", timestamp),
+                ],
             ) {
                 entity.data = Some(data);
             }
@@ -23905,12 +23914,14 @@ fn set_has_subtitles(
 }
 
 /// Restores direct probe properties after the provider metadata merge. A
-/// completed video probe owns its nullable stream index and `HasSubtitles`
-/// regardless of the metadata replacement choice (FFProbeVideoInfo.cs:268,
-/// 270); metadata fill rules must not restore either from the previous
-/// probe. An audio probe owns `LyricFiles` the same way
-/// (`AudioFileProber.AddExternalLyrics`), so the lyric files that are gone
-/// do not survive as "existing" data.
+/// completed video probe owns its nullable stream index, `HasSubtitles` and
+/// `Timestamp` regardless of the metadata replacement choice
+/// (FFProbeVideoInfo.cs:247, 268, 270); metadata fill rules must not restore
+/// any from the previous probe, and a probe that found no timestamp clears
+/// the stored one with a JSON null, which a locked row's save also reads as
+/// clear (a key it does not carry it keeps). An audio probe owns `LyricFiles`
+/// the same way (`AudioFileProber.AddExternalLyrics`), so the lyric files
+/// that are gone do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
@@ -23920,6 +23931,15 @@ fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
         Some("Video") => ["DefaultVideoStreamIndex", "HasSubtitles"]
             .into_iter()
             .filter_map(|key| data.get(key).cloned().map(|value| (key, Some(value))))
+            .chain([(
+                "Timestamp",
+                data.get("Timestamp").cloned().or_else(|| {
+                    row.data
+                        .as_deref()
+                        .is_some_and(|text| text.contains("\"Timestamp\""))
+                        .then_some(serde_json::Value::Null)
+                }),
+            )])
             .collect(),
         // No key: the track has no lyric files now, and the stored list goes.
         Some("Audio") => vec![("LyricFiles", data.get("LyricFiles").cloned())],
@@ -48367,6 +48387,94 @@ mod chapter_image_refresh_tests {
                     "locked={locked}, streams={}",
                     probed.media_source.media_streams.len()
                 );
+            }
+        }
+    }
+
+    /// `video.Timestamp = mediaInfo.Timestamp` (`FFProbeVideoInfo.cs:247`,
+    /// gl-2037): a completed video probe stores a local TS/M2TS file's
+    /// transport stream timestamp in `Data`; one that found none (its header
+    /// unreadable, or another container) clears the stored one with a JSON
+    /// null. The metadata merge keeps the probe's answer, and a locked row's
+    /// save (`with_locked_scan_fields`) stores it, a null as no key. A failed
+    /// probe leaves the stored value.
+    #[rstest::rstest]
+    #[case::m2ts(
+        "m2ts",
+        Some(ferrofin_model::media_info::TransportStreamTimestamp::Valid),
+        Some(serde_json::json!("Valid"))
+    )]
+    #[case::unread_ts("ts", None, Some(serde_json::Value::Null))]
+    #[case::matroska("matroska", None, Some(serde_json::Value::Null))]
+    fn a_video_probe_stores_its_transport_stream_timestamp(
+        #[case] container: &str,
+        #[case] timestamp: Option<ferrofin_model::media_info::TransportStreamTimestamp>,
+        #[case] expected: Option<serde_json::Value>,
+    ) {
+        let mut info = MediaInfo::default();
+        info.media_source.video_type = Some(VideoType::VideoFile);
+        info.media_source.container = Some(container.to_owned());
+        info.media_source.timestamp = timestamp;
+        let stored = BaseItemEntity {
+            media_type: Some("Video".to_owned()),
+            data: Some(r#"{"Timestamp":"Zero","Retained":true}"#.to_owned()),
+            ..Default::default()
+        };
+        for (probed, expected) in [
+            (Some(&info), expected),
+            (None, Some(serde_json::json!("Zero"))),
+        ] {
+            for locked in [false, true] {
+                let mut scanned = stored.clone();
+                LibraryScanner::apply_probe(&mut scanned, probed, false, FetcherPolicy::default());
+                if let Some(probed) = probed {
+                    // The probe's own answer: its value, or no key (never a null).
+                    assert_eq!(
+                        crate::item_data::parse_data(scanned.data.as_deref()).get("Timestamp"),
+                        probed
+                            .media_source
+                            .timestamp
+                            .map(|timestamp| serde_json::json!(timestamp))
+                            .as_ref()
+                    );
+                }
+                let saved = merge_onto_stored(
+                    &stored,
+                    &scanned,
+                    SaveFacts {
+                        locked,
+                        probe_ran: probed.is_some(),
+                        locked_fields: &[],
+                        merge: MergeMode::DEFAULT,
+                        before_refresh: false,
+                        replace_all: false,
+                        naming: crate::library_scan::EpisodeNaming::default(),
+                        remote_answered: false,
+                        redated: None,
+                    },
+                    None,
+                );
+                let data = crate::item_data::parse_data(saved.data.as_deref());
+                assert_eq!(
+                    data.get("Timestamp"),
+                    expected.as_ref(),
+                    "locked={locked}, probe={}",
+                    probed.is_some()
+                );
+                assert_eq!(data["Retained"], true);
+                if locked {
+                    let kept = crate::item_data::with_locked_scan_fields(
+                        stored.data.as_deref(),
+                        saved.data.as_deref(),
+                    )
+                    .or_else(|| stored.data.clone());
+                    assert_eq!(
+                        crate::item_data::parse_data(kept.as_deref()).get("Timestamp"),
+                        expected.as_ref().filter(|value| !value.is_null()),
+                        "locked save, probe={}",
+                        probed.is_some()
+                    );
+                }
             }
         }
     }
