@@ -524,3 +524,118 @@ async fn repository_install_stages_plugin_and_flags_restart() {
 
     drop(Arc::new(temp));
 }
+
+/// The second fixture plugin's id.
+const OTHER_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Two fixture plugins in `{data_dir}/plugins`, `hello.wasm` (`PLUGIN_ID`)
+/// and `other.wasm` (`OTHER_ID`), with `hello.wasm` marked in `state.json` as
+/// an uninstall that could not delete it marks it. Returns the plugins
+/// directory.
+fn stage_a_marked_plugin(root: &std::path::Path) -> std::path::PathBuf {
+    let plugins_dir = root.join("data").join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    for (name, wat) in [
+        ("hello.wasm", ferrofin_wasm::TEST_FIXTURE_WAT.to_owned()),
+        (
+            "other.wasm",
+            ferrofin_wasm::TEST_FIXTURE_WAT.replace(PLUGIN_ID, OTHER_ID),
+        ),
+    ] {
+        std::fs::write(
+            plugins_dir.join(name),
+            wat::parse_str(wat).expect("fixture compiles"),
+        )
+        .unwrap();
+    }
+    let state_dir = root.join("config").join("plugins");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("state.json"),
+        serde_json::json!({ "delete_on_startup": [std::ffi::OsString::from("hello.wasm")] })
+            .to_string(),
+    )
+    .unwrap();
+    plugins_dir
+}
+
+/// Boots the server on `root` and returns which fixture plugins it registered.
+async fn boot_and_list_fixture_plugins(root: &std::path::Path) -> Vec<String> {
+    let config = Config::test_stub(root);
+    let db = Database::connect(&config.database_url())
+        .await
+        .expect("open db");
+    db.run_migrations().await.expect("migrations");
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
+        ffmpeg: std::path::PathBuf::from("ffmpeg"),
+        ffprobe: std::path::PathBuf::from("ffprobe"),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    };
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+        .await
+        .expect("wire app state");
+    wired
+        .state
+        .plugins
+        .list_plugins()
+        .await
+        .expect("plugins")
+        .into_iter()
+        .map(|plugin| plugin.id.to_string())
+        .filter(|id| [PLUGIN_ID, OTHER_ID].contains(&id.as_str()))
+        .collect()
+}
+
+/// A plugin file an uninstall could not delete is marked in `state.json`
+/// (`PluginStatus.Deleted`), and the next start deletes it before the WASM
+/// host loads the directory, so the plugin is never registered
+/// (`PluginManager.LoadAssemblies`). A file no uninstall marked still loads.
+#[tokio::test]
+async fn a_plugin_file_an_uninstall_marked_is_deleted_at_the_start() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let plugins_dir = stage_a_marked_plugin(temp.path());
+
+    let registered = boot_and_list_fixture_plugins(temp.path()).await;
+    assert!(
+        !plugins_dir.join("hello.wasm").exists(),
+        "deleted at the start"
+    );
+    assert_eq!(registered, [OTHER_ID]);
+}
+
+/// A marked file the start still cannot delete stays marked and is not
+/// loaded (`PluginStatus.Deleted`: "It will not be loaded, if unable to do
+/// so").
+#[cfg(unix)]
+#[tokio::test]
+async fn a_marked_plugin_file_the_start_cannot_delete_is_not_loaded() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let plugins_dir = stage_a_marked_plugin(temp.path());
+    // Gives the directory back, so the test's clean-up can remove it.
+    let _restore = std::mem::DropGuard::new(&plugins_dir, |dir| {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    });
+    std::fs::set_permissions(&plugins_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    if std::fs::write(plugins_dir.join("probe"), b"").is_ok() {
+        eprintln!("skipped: the plugins directory takes a file at mode 0o555 (running as root?)");
+        return;
+    }
+
+    let registered = boot_and_list_fixture_plugins(temp.path()).await;
+    assert!(plugins_dir.join("hello.wasm").exists());
+    assert_eq!(registered, [OTHER_ID], "not loaded");
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(temp.path().join("config/plugins/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_value::<Vec<std::ffi::OsString>>(state["delete_on_startup"].clone())
+            .unwrap(),
+        [std::ffi::OsString::from("hello.wasm")],
+        "still marked: the next start tries again"
+    );
+}

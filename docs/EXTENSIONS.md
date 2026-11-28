@@ -289,6 +289,10 @@ without it. It removes none while a `*.wasm` file fails to load or the directory
 listed. A plugin taken out by moving its file away or renaming it to something other than
 `*.wasm` loses its segment output the same way and has to analyse the library again.
 
+An uninstall that cannot delete the plugin's file (a read-only `{data_dir}/plugins/`, say)
+still succeeds, as on Jellyfin: the file is marked in `{config_dir}/plugins/state.json`, and
+each start deletes it before loading the directory and does not load it while it cannot.
+
 **The plugin's image.** A package whose repository entry has an `imageUrl` gets that image
 as its dashboard icon, as on Jellyfin: the install downloads it into the plugin's directory
 (`{config_dir}/plugins/{id}/`), and a catalog fetch downloads it for an installed plugin
