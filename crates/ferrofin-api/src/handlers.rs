@@ -3200,13 +3200,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and ISO-8859-8-I from the same measurement. With it the guide sweeps of \
                    ks_c_5601-1987, shift_jis and euc-jp list what Jellyfin lists for all 28,800 \
                    sequences each, and those of gb18030, gb2312, euc-kr and big5 but for the \
-                   differences below; the book sweeps are the same but for a bare carriage \
-                   return. Behind an M3U tuner, the programme titles and overviews of guides \
-                   in nine legacy encodings, each holding a sequence with no character, are \
-                   the same on both servers after a guide refresh, where none of them was \
-                   stored before. A lead byte right before markup takes its < in the \
-                   double-byte code pages, on Jellyfin too, where that guide answers 500 and \
-                   that book is not read; the guide is unreadable here as well.",
+                   differences below; the book sweeps are the same as the guide sweeps. Line \
+                   ends were measured with them (gl-2029): XmlReader.Create, which loads a \
+                   ComicInfo.xml beside the comic and, through XDocument.Load, the one in its \
+                   archive, reads CR LF and a lone CR in the document as one line feed, in a \
+                   CDATA section too and not in a character reference, where \
+                   XmlDocument.Load, which loads an OPF, keeps them; books.rs xml_document \
+                   normalises by LineEnds accordingly, before tokenizing, and with it the 237 \
+                   sweep cells that kept a carriage return where Jellyfin reads a line feed \
+                   are Jellyfin's. Behind an M3U tuner, the programme titles and overviews of \
+                   guides in nine legacy encodings, each holding a sequence with no \
+                   character, are the same on both servers after a guide refresh, where none \
+                   of them was stored before. A lead byte right before markup takes its < in \
+                   the double-byte code pages, on Jellyfin too, where that guide answers 500 \
+                   and that book is not read; the guide is unreadable here as well.",
         date: "2026-11-27",
         divergences: &[
             "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
@@ -3285,8 +3292,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A book's XML that is not well-formed once decoded is read for what the \
              tokenizer accepts, where upstream's XDocument.Load and XmlDocument.Load refuse \
              it: a lead byte of a double-byte code page right before a closing tag leaves \
-             the tag's remains in the text, and a ComicInfo.xml keeps a bare carriage \
-             return XmlReader reads as a line feed. Fix path: gl-2029.",
+             the tag's remains in the text. Owner decision pending, tracked in gl-2032.",
             "An XML document's encoding name is looked up in the WHATWG labels, not in .NET's \
              table: 73 labels .NET does not know are read where Jellyfin refuses the \
              document, hz-gb-2312, iso-2022-kr and csiso2022kr are refused where .NET \
