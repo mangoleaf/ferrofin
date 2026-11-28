@@ -200,7 +200,8 @@ fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
 /// `xml` with each CR LF and each lone CR as one line feed: what an XML
 /// processor does to a document before parsing it (XML 1.0, section 2.11). A
 /// character reference is still `&#13;` here, so it stays a carriage return.
-fn line_feeds(xml: &str) -> Cow<'_, str> {
+/// The savers write text the same way ([`crate::xbmc::saver`]).
+pub(crate) fn line_feeds(xml: &str) -> Cow<'_, str> {
     if xml.contains('\r') {
         Cow::Owned(xml.replace("\r\n", "\n").replace('\r', "\n"))
     } else {

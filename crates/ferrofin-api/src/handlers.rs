@@ -960,8 +960,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// their charset, which the subtitle stream operations and the playlist scan
 /// share; how an XML document that declares a legacy encoding is read
 /// with the same decoder, a book's `ComicInfo.xml` or OPF and an XMLTV guide;
-/// and which line ends the text of an XML metadata file is read with (a
-/// book's, an NFO, a `collection.xml` or a `playlist.xml`).
+/// and which line ends the text of an XML metadata file is read and saved
+/// with (a book's, an NFO, a `collection.xml` or a `playlist.xml`).
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -2952,7 +2952,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    value is as the document holds it instead: XmlDocument.Load's reader has \
                    Normalization off for it too, Jellyfin 12.4 stores the line ends and the \
                    tab of a calibre:series attribute, and XmlCursor::as_written reads a value \
-                   with its references resolved and nothing else changed. \
+                   with its references resolved and nothing else changed. The savers write \
+                   text as XmlWriter's default NewLineHandling.Replace does (BaseNfoSaver.Save, \
+                   BaseXmlSaver.Save): xbmc/saver.rs escape_text writes CR LF and a lone CR as \
+                   a line feed, the newline of every file written here, so an overview \
+                   holding them is saved to an NFO's <plot> and to a collection.xml's and a \
+                   playlist.xml's <Overview> with line feeds, as Jellyfin 12.4 saves it, and \
+                   is read back with them on both servers. \
                    Behind an M3U tuner, the programme titles and overviews of \
                    guides in nine legacy encodings, each holding a sequence with no \
                    character, are the same on both servers after a guide refresh, where none \
@@ -3046,6 +3052,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              A UTF-8 byte-order mark decides the encoding whatever the declaration then \
              names, where XmlReader switches to a declared 8-bit encoding. Fix path: gl-939, \
              which holds the measured lists for the book readers and the guide reader.",
+            "A custom tag the NFO saver carries over from the file it rewrites is copied as \
+             that file holds it, where upstream's AddCustomTags reads it through \
+             XmlReader.Create and writes it through the XmlWriter: Jellyfin 12.4 writes its \
+             text and a CDATA section with line feeds, a referenced carriage return as a \
+             line feed and an attribute's line end as a space. Fix path: gl-2042.",
         ],
     },
 ];

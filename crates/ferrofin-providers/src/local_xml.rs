@@ -1526,6 +1526,23 @@ mod tests {
         );
     }
 
+    /// `BaseXmlSaver` writes through an `XmlWriter` with the default
+    /// `NewLineHandling.Replace` too: for an overview holding CR LF and a
+    /// lone CR, Jellyfin 12.4's `collection.xml` and `playlist.xml` hold
+    /// line feeds (gl-2033).
+    #[rstest::rstest]
+    #[case::collection_xml(save_collection_xml)]
+    #[case::playlist_xml(save_playlist_xml)]
+    fn a_container_xml_is_saved_with_line_feeds(#[case] save: fn(&LocalContainerXml) -> String) {
+        let mut container = LocalContainerXml::default();
+        container.item.item.overview = Some("one\r\ntwo\rthree\nfour".to_owned());
+        let xml = save(&container);
+        assert!(
+            xml.contains("<Overview>one\ntwo\nthree\nfour</Overview>"),
+            "{xml:?}"
+        );
+    }
+
     /// A provider key `XmlWriter` cannot name an element after is left out.
     #[test]
     fn a_provider_key_that_is_no_xml_name_is_not_written() {
